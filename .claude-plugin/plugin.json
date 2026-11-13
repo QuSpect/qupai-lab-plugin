@@ -1,0 +1,46 @@
+{
+  "name": "qupai-lab",
+  "displayName": "QuPai Lab",
+  "version": "0.1.0",
+  "description": "Work with a QuPai lab from Claude Code: the lab's instruments as tools through QuPai, how to operate them safely, and its live page in the browser.",
+  "author": {
+    "name": "QuSpect"
+  },
+  "homepage": "https://github.com/QuSpect/qupai-lab-plugin",
+  "repository": "https://github.com/QuSpect/qupai-lab-plugin",
+  "license": "MIT",
+  "keywords": [
+    "qupai",
+    "lab",
+    "instruments",
+    "instrucore",
+    "mcp"
+  ],
+  "userConfig": {
+    "qupai_web": {
+      "type": "string",
+      "title": "QuPai web address",
+      "description": "Where you sign in to QuPai, without a trailing slash, for example https://qupai.quspect.com",
+      "default": "https://qupai.quspect.com",
+      "required": false
+    },
+    "gateway": {
+      "type": "string",
+      "title": "QuPai gateway address",
+      "description": "The part before /mcp/ in the address your lab's page in QuPai shows under Use in Claude or another agent, without a trailing slash",
+      "required": true
+    },
+    "lab": {
+      "type": "string",
+      "title": "Lab id",
+      "description": "Your lab's id in QuPai, for example csmot: the address ends in /mcp/lab-<lab id>",
+      "required": true
+    }
+  },
+  "mcpServers": {
+    "lab": {
+      "type": "http",
+      "url": "${user_config.gateway}/mcp/lab-${user_config.lab}"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "qupai-lab",
+  "description": "The QuPai Lab plugin for Claude Code",
+  "owner": { "name": "QuSpect" },
+  "plugins": [
+    {
+      "name": "qupai-lab",
+      "source": "./",
+      "description": "Work with a QuPai lab from Claude Code: its instruments as tools, how to operate them safely, and its live page."
+    }
+  ]
+}
