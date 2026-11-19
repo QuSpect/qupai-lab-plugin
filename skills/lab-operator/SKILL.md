@@ -1,6 +1,6 @@
 ---
 name: lab-operator
-description: Operate a QuPai lab's instruments through this plugin's lab tools (machines, describe, read, write, sweep, sessions, stop). Use when the user asks to look at, measure with, rehearse on or control the instruments of their QuPai lab.
+description: Operate a QuPai lab's instruments through this plugin's lab tools (machines, describe, read, write, sweep, sessions). Use when the user asks to look at, measure with, rehearse on or control the instruments of their QuPai lab.
 ---
 
 # Operating a QuPai lab
@@ -13,7 +13,7 @@ What the user's role allows:
 
 | Role | Simulated copies | Real machines |
 | --- | --- | --- |
-| View | Everything | Read, watch live, `stop` |
+| View | Everything | Read, watch live |
 | Operate | Everything | Also hold a machine in a session and write to it |
 | Admin | Everything | Also end someone else's session |
 
@@ -22,8 +22,8 @@ user's own role is.
 
 ## Rules
 
-1. **Look first.** Call `machines`, then `describe` the machine or instrument before acting: its operations, units,
-   limits and safe state.
+1. **Look first.** Call `machines`, then `describe` the machine or instrument before acting: its operations, units
+   and limits.
 2. **Rehearse on a simulated copy.** `start_simulated_session` with the machine's pool gives a fresh copy with the same
    instruments, operations and limits and no hardware. End it with `end_session` when done.
 3. **Ask before a real write.** Before anything that changes a real machine, tell the user exactly what you will
@@ -31,8 +31,10 @@ user's own role is.
    while working, and end it when done.
 4. **Limits hold for everyone.** You get the lab's stricter agent limits. On `LIMIT_EXCEEDED`, report the limit and
    the value; never nudge a value to get past a limit.
-5. **Stop when something looks wrong.** `stop` puts a machine in its safe state, for anyone, at any time. Say that
-   you did it and why.
+5. **Stop when something looks wrong.** Make no further change and tell the user what you saw. There is no
+   machine-wide stop: an instrument is turned off by its own operations (an output off, a sequencer's `stop`), written
+   in your session like any other write, after telling the user exactly what you will write. Without a session, name
+   the instrument and leave it to the user.
 6. **Say where each number came from:** the real machine, or a simulated copy.
 7. **The user can watch.** `/qupai-lab:watch` opens the lab's live page in QuPai, where every call shows in the
    activity strip, yours marked as an agent's.
