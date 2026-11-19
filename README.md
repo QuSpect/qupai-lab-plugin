@@ -5,8 +5,8 @@ says how to operate them safely, and one command that opens the lab's live page.
 
 | Part | What it is |
 | --- | --- |
-| The `lab` tools | Your lab through QuPai's gateway: `machines`, `describe`, `read`, `write`, `sweep`, sessions, simulated copies, `stop`. QuPai checks your role on the lab and the lab's limits on every call |
-| `lab-operator` skill | How Claude works on a lab: look first, rehearse on a simulated copy, ask before writing to a real machine, never get around a limit, `stop` when something looks wrong |
+| The `lab` tools | Your lab through QuPai's gateway: `machines`, `describe`, `read`, `write`, `sweep`, sessions, simulated copies. QuPai checks your role on the lab and the lab's limits on every call |
+| `lab-operator` skill | How Claude works on a lab: look first, rehearse on a simulated copy, ask before writing to a real machine, never get around a limit, stop and tell you when something looks wrong |
 | `/qupai-lab:watch` | Opens the lab's live page (Instruments, live) in your browser |
 
 ## Install
@@ -39,8 +39,9 @@ Claude Code keeps the sign-in; QuPai decides what it allows.
 
 ## What Claude can do there
 
-What your role on the lab allows: with view, everything on the simulated copies and reading, watching and `stop` on
-the real machines; with operate, also holding a real machine and writing to it. The lab's admin may hold agents
+What your role on the lab allows: with view, everything on the simulated copies and reading and watching the real
+machines; with operate, also holding a real machine and writing to it, which is also how an instrument is turned off:
+InstruCore has no machine-wide stop. The lab's admin may hold agents
 outside QuPai, such as Claude Code, to view. Every call shows on the lab's live page, marked as an agent's.
 
 ## Privacy
