@@ -8,7 +8,7 @@ says how to operate them safely, and one command that opens the lab's live page.
 | The `lab` tools | Your lab through QuPai's gateway: `machines`, `describe`, `read`, `write`, `sweep`, sessions, simulated copies. QuPai checks your role on the lab and the lab's limits on every call |
 | `lab-operator` skill | How Claude works on a lab: look first, rehearse on a simulated copy, ask before writing to a real machine, never get around a limit, stop and tell you when something looks wrong |
 | `/qupai-lab:watch` | Opens the lab's live page (Instruments, live) in your browser |
-| The Lab SDK | `qupai-lab`, a Python package in [`sdk/python`](sdk/python/README.md) for scripts that work the lab through InstruCore's REST API: simulated copies held for a block, instruments by role, a record of every call and the changes for a live run's card |
+| The Lab SDK | `qupai-lab`, a Python package in [`sdk/python`](sdk/python/README.md) for scripts that work the lab through InstruCore's REST API: simulated copies held for a block, instruments by role, a record of every call, the changes for a live run's card, and live runs in the lab's queue (`qupai-lab run`) |
 
 ## Install
 

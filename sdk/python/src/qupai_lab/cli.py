@@ -1,4 +1,5 @@
-"""``qupai-lab machines``: the lab's machines, the check that this sandbox (or PC) reaches its lab."""
+"""``qupai-lab machines``: the lab's machines, the check that this sandbox (or PC) reaches its lab.
+``qupai-lab run``: a live run's script, as QuPai starts it after the member approved the run (``runner``)."""
 
 from __future__ import annotations
 
@@ -7,7 +8,7 @@ import json
 import sys
 from typing import Any
 
-from qupai_lab import __version__, config
+from qupai_lab import __version__, config, runner
 from qupai_lab.errors import LabError
 from qupai_lab.lab import Lab, listed
 
@@ -62,7 +63,21 @@ def main(argv: list[str] | None = None) -> int:
         "QUPAI_LAB_KEY, read from the environment, the nearest .env up from here, or /workspace/project/.env.",
     )
     p.add_argument("--json", action="store_true", help="print JSON")
+    r = sub.add_parser(
+        "run",
+        help="run a live run's script (QuPai starts it once the member approved the run)",
+        description="Reads the run's settings from the key file and deletes it, checks the commit out into "
+        "/tmp/qupai-run-<run>, runs `python run.py <machine>` in the experiment's folder there with the run's key, "
+        "copies data/, figures/, calls.jsonl and changes.json to <experiment>/runs/<run>/ and exits with the "
+        "script's exit code. SIGTERM and SIGINT are passed to the script; it is killed 20 s later.",
+    )
+    r.add_argument("--key-file", required=True, help="the run's key file (KEY=VALUE lines), deleted once read")
+    r.add_argument("--commit", required=True, help="the approved commit")
+    r.add_argument("experiment", help="the experiment's folder, relative to the repository's root")
+    r.add_argument("machine", help="the live machine the run holds")
     args = parser.parse_args(argv)
+    if args.command == "run":
+        return runner.run(args.key_file, args.commit, args.experiment, args.machine)
     if args.command != "machines":
         parser.print_help(sys.stderr)
         return 2

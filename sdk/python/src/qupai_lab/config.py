@@ -12,6 +12,9 @@ from qupai_lab.errors import LabError
 
 URL_ENV = "QUPAI_LAB_URL"
 KEY_ENV = "QUPAI_LAB_KEY"
+# Set by ``qupai-lab run`` for the script of a live run: the run's id and the live machine it holds.
+RUN_ENV = "QUPAI_LAB_RUN"
+RUN_MACHINE_ENV = "QUPAI_LAB_RUN_MACHINE"
 # A QuPai lab project's checkout in the sandbox: its .env holds the project key.
 PROJECT_ENV = Path("/workspace/project/.env")
 SCRIPT_REF_MAX = 300
@@ -77,6 +80,11 @@ def settings() -> tuple[str, str]:
     return found[URL_ENV], found[KEY_ENV]
 
 
+def run() -> tuple[str | None, str | None]:
+    """Inside a live run: its id (``QUPAI_LAB_RUN``) and its machine (``QUPAI_LAB_RUN_MACHINE``); else None."""
+    return (os.environ.get(RUN_ENV, "").strip() or None, os.environ.get(RUN_MACHINE_ENV, "").strip() or None)
+
+
 def _git(folder: Path, *args: str) -> str | None:
     try:
         done = subprocess.run(
@@ -125,3 +133,20 @@ def running_script_ref() -> str | None:
         main = sys.modules.get("__main__")
         _cached.append(script_ref_for(getattr(main, "__file__", None)))
     return _cached[0]
+
+
+def running_script_blob() -> str | None:
+    """The git blob id of the running script's file (``git hash-object`` of it), or None when there is no file:
+    what the live run's card compares with the run's commit to say whether this file was rehearsed."""
+    import hashlib
+    import sys
+
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()

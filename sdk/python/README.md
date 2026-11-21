@@ -1,8 +1,9 @@
 # QuPai Lab SDK (`qupai-lab`)
 
 Work a QuPai lab's instruments from Python: the lab's machines, sessions on simulated copies, instruments by
-role, and the files an experiment keeps. It calls InstruCore's own REST API (not MCP), so one script runs in a
-QuPai lab project's sandbox and at the lab PC. Python 3.10 or later, standard library only.
+role, the files an experiment keeps, and live runs in the lab's queue. It calls InstruCore's own REST API (not
+MCP), so one script runs in a QuPai lab project's sandbox and at the lab PC. Python 3.10 or later, standard
+library only.
 
 ## Install
 
@@ -82,10 +83,17 @@ machine the pool simulates, when their roles have the same names.
 | --- | --- |
 | A simulated pool (`signal-bench-sim`) | A free copy is held for the block. When none is free the block waits in the pool's queue, asking again when a copy is offered; `wait_s` gives up and leaves the queue. The copy is released at the block's end, also when the block raises, and reset for the next user |
 | One simulated copy (`signal-bench-sim-2`) | That copy, the same way |
-| A live machine (`signal-bench`) | Nothing is held. The member holds a live machine, in the conversation; the lab answers a script's session there with `RUN_REQUIRED` and a write the member did not allow with `APPROVAL_REQUIRED` |
+| The run's live machine, inside a [live run](#live-runs) (`QUPAI_LAB_RUN_MACHINE`, by id or public id) | Held for the block: `POST sessions` with `{"purpose": "run <run id>", "queue": true}`. While others hold or wait for it, the block waits in the machine's queue and asks again when it is offered; the lab holds it for the run's longest time. Released at the block's end, as a copy is |
+| Any other live machine (`signal-bench`) | Nothing is held. The member holds a live machine, in the conversation; the lab answers a script's session there with `RUN_REQUIRED` and a write the member did not allow with `APPROVAL_REQUIRED` |
 
-Code holds a live machine only as a run the member approved (live runs in the lab's queue come in a later
-version). Rehearse on a copy first.
+Code holds a live machine only as a run the member approved. Rehearse on a copy first.
+
+SIGTERM and SIGINT while a block holds a machine (a copy, or a run's live machine) release it before the script
+exits: the first one raises `SystemExit(143)` (SIGTERM) or `KeyboardInterrupt` (SIGINT) in the block, the block's
+end releases the session with the reason `qupai-lab: stopped by SIGTERM`, and a request still in the queue is
+withdrawn. A signal that comes while a session starts or ends waits until that call is done; a repeat while the
+script stops is ignored. The handlers are installed when the block starts and the script's own are back at its
+end (a signal the script ignores stays ignored). Only the main thread installs them.
 
 ## The record and `changes.json`
 
@@ -113,6 +121,54 @@ Every request sends `Authorization: Bearer <key>` and `X-InstruCore-Script: <scr
 script's path in its git repository and the short commit, so the lab's record shows the code behind each call.
 Outside a git repository the header is left out; `Lab(…, script_ref="…")` sets it, `script_ref=""` sends none.
 
+## Live runs
+
+When the member approves a live run (QuPai's `lab_run`, or Run on an experiment folder), QuPai writes the run's key
+file into the place's repository and starts, in the repository's root:
+
+```
+qupai-lab run --key-file .qupai/runs/<run>/key.env --commit <sha> experiments/2026-11-21-freq signal-bench
+```
+
+1. It reads `QUPAI_LAB_URL`, `QUPAI_LAB_KEY` (the run's key), `QUPAI_LAB_RUN` (the run's id) and
+   `QUPAI_LAB_RUN_MACHINE` from the key file (`KEY=VALUE` lines) and deletes it at once, whatever it holds. The
+   machine must be the one named on the command line.
+2. It checks the commit out into `/tmp/qupai-run-<run>` (`git worktree add --detach`, in the repository found from
+   the working directory). The experiment folder's committed `data/`, `figures/`, `calls.jsonl` and
+   `changes.json` (a rehearsal's) are removed from that checkout, so what the run keeps is its own.
+3. It runs `python run.py <machine>` in `<checkout>/<experiment>` with the Python it runs in, with the four
+   settings in place of any other `QUPAI_*` variable and `PYTHONUNBUFFERED=1`. The script's output is the
+   command's own, as it is printed. The script's `Lab.from_env()` gets the run's key, and `lab.machine(<machine>)`
+   holds the live machine (above).
+4. When the script ends it copies the `data/`, `figures/`, `calls.jsonl` and `changes.json` the script left to
+   `<experiment>/runs/<run>/` in the repository, and removes the checkout, also when the script failed.
+5. It exits with the script's exit code (128 + the signal's number when a signal ended the script).
+
+SIGTERM and SIGINT are passed to the script, which releases the machine and exits; a script that has not ended
+20 s later is killed. What it left is still copied and the checkout removed. A run that cannot start (a key file
+without the four settings, another machine, no repository, no such commit, no `run.py` in the experiment at that
+commit) says why on stderr and exits with 2, after deleting the key file.
+
+### Points for QuPai (`QUPAI_METRIC`)
+
+Inside a run (`QUPAI_LAB_RUN` set) the SDK prints the run's progress on stdout as lines QuPai's Runtime takes from
+a background job's output, one point each:
+
+```
+QUPAI_METRIC {"key": "queue_position", "value": 2}
+QUPAI_METRIC {"key": "held", "value": 1}
+QUPAI_METRIC {"key": "calls", "value": 14}
+QUPAI_METRIC {"key": "held", "value": 0}
+```
+
+| Key | When |
+| --- | --- |
+| `queue_position` | The request's position in the machine's queue, when it is queued and each time it moves |
+| `held` | 1 when the session starts, 0 when it is released |
+| `calls` | The instrument calls made so far (reads, writes and checks, refused ones too), at most every 5 s, and when the session is released and the script exits |
+
+Outside a run nothing is printed on stdout.
+
 ## Errors
 
 A refusal raises `LabError`, with `code`, `message` (the lab's sentence as it sent it), `detail` and `status`
@@ -138,7 +194,8 @@ python3 -m venv .venv && .venv/bin/pip install -e . pytest
 .venv/bin/pytest -q
 ```
 
-They run against a fake InstruCore in a thread. `tests/test_integration.py` also runs against a real InstruCore
+They run against a fake InstruCore in a thread; `qupai-lab run`'s tests make git repositories under the test's
+temporary folder and checkouts in `/tmp/qupai-run-<run>`, and send signals to scripts in subprocesses. `tests/test_integration.py` also runs against a real InstruCore
 with a simulated pool when `QUPAI_LAB_IT_URL` and `QUPAI_LAB_IT_KEY` (a read-write key) are set;
 `QUPAI_LAB_IT_POOL` picks the pool.
 
