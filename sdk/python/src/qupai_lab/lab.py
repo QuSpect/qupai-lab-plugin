@@ -1,4 +1,5 @@
-"""The Lab SDK over InstruCore's REST API: machines, sessions on simulated copies, instruments by role."""
+"""The Lab SDK over InstruCore's REST API: machines, sessions on simulated copies and on a run's live machine,
+instruments by role."""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from types import TracebackType
 from typing import Any
 from urllib.parse import quote
 
-from qupai_lab import __version__, config
+from qupai_lab import __version__, config, metric, stop
 from qupai_lab import changes as _changes
 from qupai_lab.errors import LabError, from_response
 from qupai_lab.record import Recorder, dumps, ensure_parent, now_iso
@@ -26,6 +27,7 @@ RETRIES_429 = 5
 RETRY_AFTER_DEFAULT_S = 2.0
 TIMEOUT_S = 150.0
 POLL_S = 2.0
+CALLS_EVERY_S = 5.0  # inside a run, the ``calls`` point at most this often
 _GONE = ("cancelled", "expired")  # a queue request that ended this way is never offered
 
 
@@ -93,7 +95,12 @@ class Lab:
         self._sleep: Callable[[float], None] = time.sleep
         self._writes: list[_changes.Write] = []
         self._machines_used: list[str] = []
-        atexit.register(self.recorder.flush)
+        # Inside a live run (``qupai-lab run``): its id, and the live machine ``machine()`` holds for it.
+        self.run_id, self.run_machine = config.run()
+        self._calls = 0
+        self._calls_told = 0
+        self._calls_at = float("-inf")
+        atexit.register(self._at_exit)
 
     @classmethod
     def from_env(cls, record: str | os.PathLike[str] | None = None) -> Lab:
@@ -114,6 +121,26 @@ class Lab:
     def close(self) -> None:
         """Writes the record's last line. A Lab keeps no connection open."""
         self.recorder.flush()
+        self._tell_calls()
+
+    def _at_exit(self) -> None:
+        self.recorder.flush()
+        self._tell_calls()
+
+    # ---- a live run's points (QUPAI_METRIC) ----
+
+    def _called(self) -> None:
+        self._calls += 1
+        if self.run_id and time.monotonic() - self._calls_at >= CALLS_EVERY_S:
+            self._tell_calls()
+
+    def _tell_calls(self) -> None:
+        if self.run_id and self._calls != self._calls_told:
+            metric.emit("calls", self._calls)
+            self._calls_told, self._calls_at = self._calls, time.monotonic()
+
+    def _is_run_machine(self, m: dict[str, Any]) -> bool:
+        return bool(self.run_machine) and self.run_machine in (m.get("id"), m.get("public_id"))
 
     # ---- HTTP ----
 
@@ -224,8 +251,12 @@ class Lab:
 
         A simulated pool or copy is held for the block: a pool gives a free copy, and when none is free the
         block waits in the pool's queue until one is offered (at most ``wait_s`` seconds when given). It is
-        released at the block's end, also when the block raises. A live machine is not held: the member or
-        the conversation holds it, and the lab refuses what it must (``RUN_REQUIRED``, ``APPROVAL_REQUIRED``)."""
+        released at the block's end, also when the block raises or SIGTERM or SIGINT stops the script.
+
+        A live machine is held only inside a live run (``qupai-lab run``), and only the run's own machine
+        (``QUPAI_LAB_RUN_MACHINE``): the block waits in the machine's queue for its turn, the same way. Any
+        other live machine is not held: the member or the conversation holds it, and the lab refuses what it
+        must (``RUN_REQUIRED``, ``APPROVAL_REQUIRED``)."""
         return Machine(self, machine_id, purpose=purpose, wait_s=wait_s)
 
     # ---- files ----
@@ -295,7 +326,8 @@ def _find(items: list[dict[str, Any]], target: str) -> dict[str, Any] | None:
 
 
 class Machine:
-    """A machine of the lab, as ``lab.machine(id)`` gives it. ``with`` holds a simulated one."""
+    """A machine of the lab, as ``lab.machine(id)`` gives it. ``with`` holds a simulated one, and inside a live
+    run the run's live machine."""
 
     def __init__(self, lab: Lab, target: str, *, purpose: str = "", wait_s: float | None = None) -> None:
         self.lab = lab
@@ -308,6 +340,7 @@ class Machine:
         self.held = False
         self.session: dict[str, Any] | None = None
         self.roles: dict[str, str] = {}
+        self._guarded = False
 
     def __repr__(self) -> str:
         return f"Machine({self.public_id or self.target!r}, kind={self.kind!r}, held={self.held})"
@@ -328,17 +361,20 @@ class Machine:
                 {"machine": self.target, "known": known},
                 404,
             )
-        if machine is not None and machine.get("kind") == "live":
+        live = machine is not None and machine.get("kind") == "live"
+        if live and not self.lab._is_run_machine(machine):
             self._use(machine)  # not held: the member or the conversation holds a live machine
             return self
-        self.session = self._hold()
-        self.id = self.session.get("machine") or self.target
-        self.held = True
+        self._guarded = stop.hold()  # SIGTERM and SIGINT from here on release what is held
         try:
-            copy = _find(machines, self.id) or self.lab.request("GET", f"/v1/machines/{_seg(self.id)}")
-            self._use(copy)
+            self._hold(live)
+            held = machine if live else _find(machines, self.id)
+            self._use(held or self.lab.request("GET", f"/v1/machines/{_seg(self.id)}"))
         except BaseException:
-            self.release(reason="qupai-lab: could not read the held copy", quiet=True)
+            try:
+                self.release(reason=self._reason("qupai-lab: could not start the block"), quiet=True)
+            finally:
+                self._unguard()
             raise
         return self
 
@@ -346,9 +382,10 @@ class Machine:
         self, kind: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
     ) -> None:
         try:
-            reason = "qupai-lab: the script's block raised" if kind else "qupai-lab: the script's block ended"
-            self.release(reason=reason, quiet=kind is not None)
+            ended = "qupai-lab: the script's block raised" if kind else "qupai-lab: the script's block ended"
+            self.release(reason=self._reason(ended), quiet=kind is not None)
         finally:
+            self._unguard()
             self.lab.recorder.flush()
 
     def release(self, *, reason: str = "qupai-lab: released", quiet: bool = False) -> dict[str, Any] | None:
@@ -358,7 +395,10 @@ class Machine:
             return None
         self.held = False
         try:
-            return self.lab.request("POST", f"/v1/machines/{_seg(self.id)}/sessions/end", {"reason": reason[:256]})
+            with stop.shielded():  # a signal now waits until the session has ended
+                return self.lab.request(
+                    "POST", f"/v1/machines/{_seg(self.id)}/sessions/end", {"reason": reason[:256]}
+                )
         except LabError as e:
             if e.code == "NOT_FOUND":
                 _say(f"the session on {self.public_id or self.id} had already ended")
@@ -367,36 +407,58 @@ class Machine:
                 raise
             _say(f"could not end the session on {self.public_id or self.id}: {e}")
             return None
+        finally:
+            if self.lab.run_id:
+                self.lab._tell_calls()
+                metric.emit("held", 0)
 
     def renew(self) -> dict[str, Any]:
-        """Restarts the held session's time limit, unless someone waits for the machine (``QUEUE_WAITING``)."""
+        """Restarts the held session's time limit, unless someone waits for the machine (``QUEUE_WAITING``).
+        A run's session has a fixed time: the lab answers ``RUN_REQUIRED``."""
         if not self.held or self.id is None:
             raise LabError("NOT_HELD", f"{self.target} is not held by this block")
         self.session = self.lab.request("POST", f"/v1/machines/{_seg(self.id)}/sessions/renew", {})
         return self.session
 
-    def _hold(self) -> dict[str, Any]:
+    def _reason(self, otherwise: str) -> str:
+        signum = stop.stopping()
+        return f"qupai-lab: stopped by {stop.name(signum)}" if signum else otherwise
+
+    def _unguard(self) -> None:
+        if self._guarded:
+            self._guarded = False
+            stop.unhold()
+
+    def _hold(self, live: bool) -> None:
         """``POST sessions`` with the queue on: 201 is the session; 202 is a queue request, looked at until it is
-        offered, then asked again (which starts the session within the offer). Leaving early withdraws it."""
-        purpose = (self.purpose or self.lab.script_ref or "qupai-lab")[:256]
-        body: dict[str, Any] = {"purpose": purpose, "queue": True, "simulated": True}
+        offered, then asked again (which starts the session within the offer). Leaving early withdraws it.
+
+        A run's live machine is asked for with ``purpose: "run <id>"`` and without ``simulated``: the lab
+        holds it for the run's longest time."""
+        if live:
+            body: dict[str, Any] = {"purpose": f"run {self.lab.run_id or ''}".strip()[:256], "queue": True}
+        else:
+            purpose = (self.purpose or self.lab.script_ref or "qupai-lab")[:256]
+            body = {"purpose": purpose, "queue": True, "simulated": True}
+        what = self.target if live else f"a copy of {self.target}"
         path = f"/v1/machines/{_seg(self.target)}/sessions"
-        answer = self.lab._request("POST", path, body)
+        answer = self._ask(path, body)
         if answer.status != 202:
-            return answer.data
+            return
         started = time.monotonic()
         request = (answer.data or {}).get("request") or {}
         rid = request.get("request_id")
         if not rid:
             raise LabError("SESSION_PENDING", f"queued for {self.target} without a request id", answer.data or {})
-        self._say_queued(answer.data, request)
+        self._say_queued(answer.data, request, live)
         position = request.get("position")
+        self._tell_position(position)
         try:
             while True:
                 if self.wait_s is not None and time.monotonic() - started >= self.wait_s:
                     raise LabError(
                         "WAIT_TIMEOUT",
-                        f"no copy of {self.target} was offered within {self.wait_s:g} s; the request was withdrawn",
+                        f"{what} was not offered within {self.wait_s:g} s; the request was withdrawn",
                         {"request_id": rid, "machine": self.target},
                     )
                 self.lab._sleep(self.lab.poll_s)
@@ -407,30 +469,50 @@ class Machine:
                     if looked.data.get("position") != position:
                         position = looked.data.get("position")
                         _say(f"waiting for {self.target}: position {position}")
+                        self._tell_position(position)
                     continue
                 self.lab._record_ok(self.lab._line("GET", poll, None), looked)  # one line when it moves on
                 if status in _GONE:
                     raise LabError(
                         f"REQUEST_{str(status).upper()}",
-                        f"the queue request for {self.target} was {status} before a copy was offered",
+                        f"the queue request for {self.target} was {status} before {what} was offered",
                         {"request_id": rid, "machine": self.target},
                     )
-                answer = self.lab._request("POST", path, body)  # offered: ask again, which starts it
+                answer = self._ask(path, body)  # offered: ask again, which starts it
                 if answer.status != 202:
-                    return answer.data
+                    return
                 request = (answer.data or {}).get("request") or {}  # the offer ran out or was withdrawn
                 rid = request.get("request_id") or rid
         except BaseException:
             try:
-                self.lab.request("DELETE", f"/v1/session-requests/{_seg(rid)}")
+                with stop.shielded():
+                    self.lab.request("DELETE", f"/v1/session-requests/{_seg(rid)}")
             except LabError:
                 pass
             raise
 
-    def _say_queued(self, data: dict[str, Any], request: dict[str, Any]) -> None:
+    def _ask(self, path: str, body: dict[str, Any]) -> _Answer:
+        """One ``POST sessions``; a 201 is taken at once, so a signal cannot fall between the start and the
+        hold."""
+        with stop.shielded():
+            answer = self.lab._request("POST", path, body)
+            if answer.status != 202:
+                self.session = answer.data if isinstance(answer.data, dict) else {}
+                self.id = self.session.get("machine") or self.target
+                self.held = True
+                if self.lab.run_id:
+                    metric.emit("held", 1)
+        return answer
+
+    def _tell_position(self, position: Any) -> None:
+        if self.lab.run_id and isinstance(position, int) and not isinstance(position, bool):
+            metric.emit("queue_position", position)
+
+    def _say_queued(self, data: dict[str, Any], request: dict[str, Any], live: bool) -> None:
         detail = ((data or {}).get("error") or {}).get("detail") or {}
         why = " (you hold as many simulated sessions as a member may)" if detail.get("reason") == "member_cap" else ""
-        _say(f"queued for {self.target} at position {request.get('position')}{why}; waiting for a copy")
+        waiting = "waiting for its turn" if live else "waiting for a copy"
+        _say(f"queued for {self.target} at position {request.get('position')}{why}; {waiting}")
 
     def _use(self, m: dict[str, Any]) -> None:
         self.id = m["id"]
@@ -474,7 +556,10 @@ class Instrument:
     def _call(self, kind: str, op: str, args: dict[str, Any], unwrap: bool) -> Any:
         note = {"machine": self.machine.public_id, "role": self.role, "instrument": self.id, "kind": kind, "op": op}
         path = f"/v1/instruments/{_seg(self.id)}/{kind}/{_seg(op)}"
-        return self.machine.lab.request("POST", path, args, note=note, unwrap=unwrap)
+        try:
+            return self.machine.lab.request("POST", path, args, note=note, unwrap=unwrap)
+        finally:
+            self.machine.lab._called()
 
     def read(self, op: str, **args: Any) -> Any:
         """Calls the read op ``op`` and answers its result. Anyone may read."""

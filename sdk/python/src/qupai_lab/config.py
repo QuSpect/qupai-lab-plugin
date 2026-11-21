@@ -12,6 +12,9 @@ from qupai_lab.errors import LabError
 
 URL_ENV = "QUPAI_LAB_URL"
 KEY_ENV = "QUPAI_LAB_KEY"
+# Set by ``qupai-lab run`` for the script of a live run: the run's id and the live machine it holds.
+RUN_ENV = "QUPAI_LAB_RUN"
+RUN_MACHINE_ENV = "QUPAI_LAB_RUN_MACHINE"
 # A QuPai lab project's checkout in the sandbox: its .env holds the project key.
 PROJECT_ENV = Path("/workspace/project/.env")
 SCRIPT_REF_MAX = 300
@@ -75,6 +78,11 @@ def settings() -> tuple[str, str]:
             {"missing": missing, "looked": looked},
         )
     return found[URL_ENV], found[KEY_ENV]
+
+
+def run() -> tuple[str | None, str | None]:
+    """Inside a live run: its id (``QUPAI_LAB_RUN``) and its machine (``QUPAI_LAB_RUN_MACHINE``); else None."""
+    return (os.environ.get(RUN_ENV, "").strip() or None, os.environ.get(RUN_MACHINE_ENV, "").strip() or None)
 
 
 def _git(folder: Path, *args: str) -> str | None:
