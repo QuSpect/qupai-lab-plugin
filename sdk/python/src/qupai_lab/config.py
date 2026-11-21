@@ -133,3 +133,20 @@ def running_script_ref() -> str | None:
         main = sys.modules.get("__main__")
         _cached.append(script_ref_for(getattr(main, "__file__", None)))
     return _cached[0]
+
+
+def running_script_blob() -> str | None:
+    """The git blob id of the running script's file (``git hash-object`` of it), or None when there is no file:
+    what the live run's card compares with the run's commit to say whether this file was rehearsed."""
+    import hashlib
+    import sys
+
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()

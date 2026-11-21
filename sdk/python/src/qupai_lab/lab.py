@@ -292,6 +292,8 @@ class Lab:
         numeric argument is ``quantity``, ``min``, ``max``; several are a box, ``ranges``; the rest ``fixed``."""
         out = {
             "script": self.script_ref,
+            # run.py's git blob id as it ran: the live run's card says rehearsed when its commit has this file.
+            "script_blob": config.running_script_blob(),
             "machines": list(self._machines_used),
             "written_at": now_iso(),
             "changes": _changes.group(self._writes),

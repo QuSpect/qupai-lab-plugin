@@ -69,3 +69,14 @@ def test_lab_changes_writes_the_file(lab: Lab, fake: FakeInstruCore, tmp_path: P
         {"role": "tbs1104_usb", "op": "set_timebase", "calls": 3, "quantity": "scale_s", "min": 0.5 / 1e5,
          "max": 0.5 / 100, "fixed": {"offset_s": 0.0}},
     ]
+
+
+def test_the_running_scripts_blob_is_gits(tmp_path) -> None:
+    import subprocess
+    import sys
+
+    script = tmp_path / "run.py"
+    script.write_text("from qupai_lab import config\nprint(config.running_script_blob())\n")
+    got = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=True).stdout.strip()
+    want = subprocess.run(["git", "hash-object", str(script)], capture_output=True, text=True, check=True).stdout.strip()
+    assert got == want
