@@ -80,6 +80,17 @@ def test_the_runs_machine_by_its_internal_id(fake: FakeInstruCore, tmp_path: Pat
     assert len(fake.calls("POST", "/v1/machines/bench/sessions/end")) == 1
 
 
+def test_a_run_that_took_its_members_own_session_leaves_it_held(
+    fake: FakeInstruCore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    fake.taken = True
+    lab = run_lab(fake, tmp_path, monkeypatch, "bench")
+    with lab.machine("signal-bench") as m:
+        assert m.held and m.taken
+    assert fake.calls("POST", "/v1/machines/bench/sessions/end") == []
+    assert "stays held" in capsys.readouterr().err
+
+
 def test_a_live_machine_that_is_not_the_runs_is_not_held(
     fake: FakeInstruCore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:

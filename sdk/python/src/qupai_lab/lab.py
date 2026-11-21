@@ -398,6 +398,11 @@ class Machine:
         if not self.held or self.id is None:
             return None
         self.held = False
+        if getattr(self, "taken", False):
+            _say(f"{self.public_id or self.id} stays held: the run used its member's own session")
+            if self.lab.run_id:
+                metric.emit("held", 0)
+            return None
         try:
             with stop.shielded():  # a signal now waits until the session has ended
                 return self.lab.request(
@@ -507,6 +512,9 @@ class Machine:
                 self.session = answer.data if isinstance(answer.data, dict) else {}
                 self.id = self.session.get("machine") or self.target
                 self.held = True
+                # A run on the machine its member already holds takes that session (InstruCore's "taken"): it is
+                # the member's, so the block leaves it held when it ends.
+                self.taken = self.session.get("taken") is True
                 if self.lab.run_id:
                     metric.emit("held", 1)
         return answer

@@ -50,6 +50,7 @@ class FakeInstruCore:
         self.requests: dict[str, dict[str, Any]] = {}
         self.polls_until_offer = 0  # > 0: a session request queues, offered after this many looks
         self.start_position = 2  # a queued request's first position; each look moves it up one, to 1
+        self.taken = False
         self.run_keys: set[str] = set()  # keys of live runs on the bench
         self.before: dict[tuple[str, str], Callable[[], None]] = {}  # called as that request arrives
         self.lock = threading.Lock()
@@ -191,7 +192,10 @@ class FakeInstruCore:
         if target == "bench":
             if "bench" in self.sessions:
                 return 409, _err("MACHINE_IN_SESSION", "bench 正在使用中", machine="bench")
-            return 201, self._session("bench", body.get("purpose", ""))
+            session = self._session("bench", body.get("purpose", ""))
+            if self.taken:  # a run on the bench its member already holds takes that session
+                session["taken"] = True
+            return 201, session
         free = [c for c in ((target,) if target in COPIES else COPIES) if c not in self.sessions]
         if not free:
             return 409, _err("MACHINE_IN_SESSION", f"{target} 正在使用中", machine=target)
