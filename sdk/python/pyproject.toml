@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qupai-lab"
+dynamic = ["version"]
+description = "The QuPai Lab SDK: work a QuPai lab's instruments from Python scripts through InstruCore's REST API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "QuSpect" }]
+keywords = ["qupai", "lab", "instruments", "instrucore"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/QuSpect/qupai-lab-plugin"
+Repository = "https://github.com/QuSpect/qupai-lab-plugin"
+
+[project.scripts]
+qupai-lab = "qupai_lab.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "qupai_lab.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs a real InstruCore (QUPAI_LAB_IT_URL, QUPAI_LAB_IT_KEY)"]
