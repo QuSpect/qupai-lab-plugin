@@ -27,6 +27,10 @@ RETRIES_429 = 5
 RETRY_AFTER_DEFAULT_S = 2.0
 TIMEOUT_S = 150.0
 POLL_S = 2.0
+# A queued request is looked at every POLL_S at first, then less often while its place does not move, up to
+# POLL_MAX_S: a run may wait hours, and each look counts against the member's per-minute calls to the lab. An
+# offer is kept for minutes (InstruCore's offer_s, 300 s by default), so POLL_MAX_S still starts it in time.
+POLL_MAX_S = 15.0
 CALLS_EVERY_S = 5.0  # inside a run, the ``calls`` point at most this often
 _GONE = ("cancelled", "expired")  # a queue request that ended this way is never offered
 
@@ -453,6 +457,7 @@ class Machine:
         self._say_queued(answer.data, request, live)
         position = request.get("position")
         self._tell_position(position)
+        still = 0  # looks since the position last moved
         try:
             while True:
                 if self.wait_s is not None and time.monotonic() - started >= self.wait_s:
@@ -461,12 +466,14 @@ class Machine:
                         f"{what} was not offered within {self.wait_s:g} s; the request was withdrawn",
                         {"request_id": rid, "machine": self.target},
                     )
-                self.lab._sleep(self.lab.poll_s)
+                self.lab._sleep(min(self.lab.poll_s * 2**still, max(POLL_MAX_S, self.lab.poll_s)))
                 poll = f"/v1/session-requests/{_seg(rid)}"
                 looked = self.lab._request("GET", poll, record=False)
                 status = (looked.data or {}).get("status")
                 if status == "pending":
+                    still = min(still + 1, 8)
                     if looked.data.get("position") != position:
+                        still = 0
                         position = looked.data.get("position")
                         _say(f"waiting for {self.target}: position {position}")
                         self._tell_position(position)
