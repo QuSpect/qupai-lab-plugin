@@ -1,0 +1,2 @@
+# The package on PyPI is the library: its tests (and their stand-in lab) stay in the repository.
+prune tests
