@@ -162,8 +162,11 @@ def test_the_index_lists_experiments_newest_first(tmp_path: Path) -> None:
             "run": "r1", "kind": "live", "status": "ended", "exit_code": 0, "commit": "abcdef0123", "dirty": False,
             "started_at": started, "calls": 7, "machines": [{"requested": "bench", "machine": "bench", "held": True}]}))
     (experiments / "2026-11-23-c").mkdir()  # not run yet
+    (experiments / "2026-11-20-a" / "runs" / "01a1ff07-old-job").mkdir()  # a run from before manifests
     path = runs.write_index(experiments)
     text = path.read_text()
+    assert "| [2026-11-20-a](2026-11-20-a/) |  | 1 live · 1 without a manifest |" in text
+    assert "| [01a1ff07-old-job](2026-11-20-a/runs/01a1ff07-old-job/) | no manifest |" in text
     order = [text.index(f"[{n}]({n}/) |") for n in ("2026-11-23-c", "2026-11-22-b", "2026-11-20-a")]
     assert order == sorted(order)
     assert "| [2026-11-23-c](2026-11-23-c/) |  | none |  |" in text

@@ -305,6 +305,14 @@ def _manifests(experiment: Path) -> list[dict[str, Any]]:
     return sorted(out, key=lambda m: (str(m.get("started_at") or ""), str(m.get("run"))), reverse=True)
 
 
+def _unrecorded(experiment: Path) -> list[str]:
+    """Run folders without a manifest (left by an SDK before 0.3.0, or by hand), by name."""
+    folder = experiment / RUNS
+    if not folder.is_dir():
+        return []
+    return sorted((p.name for p in folder.iterdir() if p.is_dir() and not (p / MANIFEST).is_file()), reverse=True)
+
+
 def _machines(m: dict[str, Any]) -> str:
     held = [x.get("machine") or x.get("requested") for x in m.get("machines") or [] if x.get("held")]
     return ", ".join(dict.fromkeys(str(x) for x in held if x)) or ", ".join(
@@ -327,16 +335,17 @@ def index_text(experiments: Path) -> str | None:
     head = ["# Experiments", "", about, "", "| Experiment | What | Runs | Last run |", "|---|---|---|---|"]
     body: list[str] = []
     for folder in folders:
-        runs = _manifests(folder)
+        runs, bare = _manifests(folder), _unrecorded(folder)
         live = sum(1 for m in runs if m.get("kind") == "live")
         counts = " · ".join(x for x in (f"{live} live" if live else "",
                                          f"{len(runs) - live} rehearsal{'s' if len(runs) - live != 1 else ''}"
-                                         if len(runs) - live else "") if x) or "none"
+                                         if len(runs) - live else "",
+                                         f"{len(bare)} without a manifest" if bare else "") if x) or "none"
         last = runs[0] if runs else None
         last_text = f"{_when(last.get('started_at'))} {last.get('kind')}, {_status(last)}" if last else ""
         link = f"[{folder.name}]({folder.name}/)"
         head.append(f"| {link} | {_cell(_title(folder / 'README.md'))} | {counts} | {_cell(last_text)} |")
-        if not runs:
+        if not runs and not bare:
             continue
         body += ["", f"## {link}", "", "| Run | Kind | Machine | Commit | Started (UTC) | Status | Calls |",
                  "|---|---|---|---|---|---|---|"]
@@ -346,6 +355,7 @@ def index_text(experiments: Path) -> str | None:
             body.append(f"| [{_cell(run[:20])}]({folder.name}/{RUNS}/{run}/) | {_cell(m.get('kind'))} | "
                         f"{_cell(_machines(m))} | {_cell(commit)} | {_when(m.get('started_at'))} | "
                         f"{_cell(_status(m))} | {_cell(m.get('calls'))} |")
+        body += [f"| [{_cell(name[:20])}]({folder.name}/{RUNS}/{name}/) | no manifest |  |  |  |  |  |" for name in bare]
     return "\n".join(head + body) + "\n"
 
 

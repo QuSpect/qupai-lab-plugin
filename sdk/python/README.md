@@ -110,10 +110,12 @@ held was a simulated copy), `experiment`, `script` and `script_blob` (its git bl
 blob id), `lab` (the listing, from a sandbox door's address; no address is kept), `machines` (each one used:
 `requested`, `machine`, `kind`, `session`, `held`, `held_at`, `released_at`), `started_at`, `ended_at`, `status`
 (`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` (a live run's),
-`calls`, `outputs` (its files, the raw ones counted in `raw_files`) and `versions`.
+`calls`, `outputs` (the files the run itself left, the raw ones counted in `raw_files`; an analysis adds its own
+later) and `versions`.
 
 `experiments/INDEX.md` lists each experiment (newest first, with its README's title) and each of its runs: kind,
-machine, commit (`*`: it differed), start, status and calls. A rehearsal writes it as it ends, `qupai-lab run`
+machine, commit (`*`: it differed), start, status and calls; a run folder without a manifest (from an SDK before
+0.3.0) is listed by name. A rehearsal writes it as it ends, `qupai-lab run`
 after a live run, and `qupai-lab index` on demand. A script outside a folder named `experiments` leaves it alone.
 
 `Lab.from_env(runs=False)`, or `QUPAI_LAB_RUNS=0`, makes no run folder: paths are then as given, from the working
