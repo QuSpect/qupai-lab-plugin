@@ -14,12 +14,14 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 from urllib.parse import quote
 
 from qupai_lab import __version__, config, metric, stop
 from qupai_lab import changes as _changes
+from qupai_lab import runs as _runs
 from qupai_lab.errors import LabError, from_response
 from qupai_lab.record import Recorder, dumps, ensure_parent, now_iso
 
@@ -77,6 +79,10 @@ class Lab:
     ``record``: a file that gets one JSON line per call, appended. ``script_ref``: what the
     ``X-InstruCore-Script`` header says; by default the running script's path in its git repository and the
     commit (``experiments/…/run.py@3f2a91c``), computed once and left out outside a repository; ``""`` sends none.
+
+    ``run_folder``: where this execution's outputs go (``Lab.from_env()`` makes one for a script, see ``runs``):
+    relative paths given to ``record``, ``save``, ``table`` and ``changes`` are inside it, and its ``manifest.json``
+    records the run. Without one, paths are as given, from the working directory.
     """
 
     def __init__(
@@ -86,6 +92,7 @@ class Lab:
         *,
         record: str | os.PathLike[str] | None = None,
         script_ref: str | None = None,
+        run_folder: _runs.RunFolder | None = None,
     ) -> None:
         if not url or not key:
             raise LabError("NOT_CONFIGURED", "Lab(url, key) needs both the lab's address and a key")
@@ -93,7 +100,8 @@ class Lab:
         self._key = key
         ref = config.running_script_ref() if script_ref is None else script_ref
         self.script_ref: str | None = ref[-config.SCRIPT_REF_MAX :] if ref else None
-        self.recorder = Recorder(os.path.abspath(record) if record is not None else None)
+        self.run_folder = run_folder
+        self.recorder = Recorder(self._path(record) if record is not None else None)
         self.timeout_s = TIMEOUT_S
         self.poll_s = POLL_S
         self._sleep: Callable[[float], None] = time.sleep
@@ -107,11 +115,68 @@ class Lab:
         atexit.register(self._at_exit)
 
     @classmethod
-    def from_env(cls, record: str | os.PathLike[str] | None = None) -> Lab:
+    def from_env(cls, record: str | os.PathLike[str] | None = None, *, runs: bool | None = None) -> Lab:
         """``QUPAI_LAB_URL`` and ``QUPAI_LAB_KEY`` from the environment, else from the nearest ``.env`` up from
-        the working directory, else from ``/workspace/project/.env``."""
+        the working directory, else from ``/workspace/project/.env``.
+
+        A script run as ``python run.py`` gets its run folder, ``<the script's folder>/runs/<id>/`` (``runs``):
+        a live run's id is its job, a rehearsal's the time it started. ``runs=False``, or ``QUPAI_LAB_RUNS=0``,
+        makes none; there is none either for ``python -c``, the interactive interpreter or a test runner."""
         url, key = config.settings()
-        return cls(url, key, record=record)
+        folder = None
+        script = _runs.main_script()
+        if runs is None:
+            runs = script is not None and os.environ.get(_runs.OFF_ENV, "").strip() != "0"
+        if runs:
+            experiment = script.parent if script is not None else Path.cwd()
+            run_id, _ = config.run()
+            folder = _runs.RunFolder(experiment, run_id or _runs.new_id(), live=bool(run_id), script=script,
+                                     argv=sys.argv[1:], lab_url=url)
+        return cls(url, key, record=record, run_folder=folder)
+
+    # ---- where a run's files go ----
+
+    @property
+    def out(self) -> Path | None:
+        """This execution's folder (``<experiment>/runs/<id>/``), or None without a run folder."""
+        return self.run_folder.path if self.run_folder else None
+
+    @property
+    def experiment(self) -> Path:
+        """The experiment's folder: the script's, or the working directory without a run folder."""
+        return self.run_folder.experiment if self.run_folder else Path.cwd()
+
+    @property
+    def inputs(self) -> Path:
+        """``<experiment>/inputs/``: the files the script reads (a sweep's values, a configuration). A live run
+        has them at its commit; the manifest lists each with its git blob id."""
+        return self.experiment / _runs.INPUTS
+
+    def input(self, name: str) -> Any:
+        """``inputs/<name>``: parsed when it is JSON (``.json``), else its text."""
+        path = self.inputs / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise LabError("NO_INPUT", f"no input {name!r}: {path} does not exist", {"input": name}) from None
+        return json.loads(text) if path.suffix.lower() == ".json" else text
+
+    def _path(self, path: str | os.PathLike[str]) -> Path:
+        """A path the script gave: inside the run folder when relative and there is one."""
+        if self.run_folder is not None:
+            return self.run_folder.resolve(path)
+        return Path(os.path.abspath(path))
+
+    def _ran(self) -> None:
+        if self.run_folder is not None:
+            self.run_folder.ensure()
+
+    def _used(self, m: Machine, *, held: bool) -> int | None:
+        if self.run_folder is None:
+            return None
+        session = (m.session or {}).get("session_id") if held else None
+        return self.run_folder.held(requested=m.target, machine=m.public_id or m.id, kind=m.kind, session=session,
+                                    held=held)
 
     def __repr__(self) -> str:
         return f"Lab({self.url!r})"
@@ -130,6 +195,16 @@ class Lab:
     def _at_exit(self) -> None:
         self.recorder.flush()
         self._tell_calls()
+        folder = self.run_folder
+        if folder is None or folder.manifest is None:
+            return
+        folder.ending(self._calls, stopped=stop.stopping() is not None)
+        experiments = _runs.index_folder(folder.experiment)
+        if experiments is not None and not folder.live:  # a live run's is written by qupai-lab run, in the repository
+            try:
+                _runs.write_index(experiments)
+            except OSError as e:
+                _say(f"could not write {experiments / _runs.INDEX}: {e}")
 
     # ---- a live run's points (QUPAI_METRIC) ----
 
@@ -213,6 +288,8 @@ class Lab:
         unwrap: bool = False,
     ) -> _Answer:
         line = self._line(method, path, body, note)
+        if record:
+            self._ran()
         retries = 0
         while True:
             try:
@@ -268,7 +345,9 @@ class Lab:
     def save(self, path: str | os.PathLike[str], value: Any, **meta: Any) -> dict[str, Any]:
         """Writes ``value`` as JSON to ``path`` (making its folders) and answers ``{"file": path, **meta}``, a
         row for ``table``. The record's line for the call that answered ``value`` names this file."""
-        ensure_parent(path).write_text(dumps(value) + "\n", encoding="utf-8")
+        self._ran()
+        target = self._path(path)
+        ensure_parent(target).write_text(dumps(value) + "\n", encoding="utf-8")
         file = os.fspath(path)
         self.recorder.claim(value, file)
         return {"file": file, **meta}
@@ -279,7 +358,8 @@ class Lab:
         columns: list[str] = []
         for row in rows:
             columns.extend(k for k in row if k not in columns)
-        with ensure_parent(path).open("w", newline="", encoding="utf-8") as f:
+        self._ran()
+        with ensure_parent(self._path(path)).open("w", newline="", encoding="utf-8") as f:
             out = csv.DictWriter(f, fieldnames=columns)
             out.writeheader()
             for row in rows:
@@ -289,7 +369,11 @@ class Lab:
     def changes(self, path: str | os.PathLike[str]) -> dict[str, Any]:
         """Writes the writes made through this Lab to ``path`` as JSON, grouped by role and op, for a live
         run's card (LS9), and answers it: ``{script, machines, written_at, changes}``. In a change one moving
-        numeric argument is ``quantity``, ``min``, ``max``; several are a box, ``ranges``; the rest ``fixed``."""
+        numeric argument is ``quantity``, ``min``, ``max``; several are a box, ``ranges``; the rest ``fixed``.
+
+        In a rehearsal with a run folder it is also written to ``<experiment>/changes.json``, the file a live
+        run's card reads, with ``run`` naming the rehearsal."""
+        self._ran()
         out = {
             "script": self.script_ref,
             # run.py's git blob id as it ran: the live run's card says rehearsed when its commit has this file.
@@ -298,7 +382,14 @@ class Lab:
             "written_at": now_iso(),
             "changes": _changes.group(self._writes),
         }
-        ensure_parent(path).write_text(dumps(out, indent=2) + "\n", encoding="utf-8")
+        folder = self.run_folder
+        if folder is not None:
+            out = {"run": folder.id, **out}
+        target = self._path(path)
+        ensure_parent(target).write_text(dumps(out, indent=2) + "\n", encoding="utf-8")
+        card = folder.experiment / _runs.CHANGES if folder is not None and not folder.live else None
+        if card is not None and card.resolve() != target.resolve():
+            card.write_text(dumps(out, indent=2) + "\n", encoding="utf-8")
         return out
 
 
@@ -347,6 +438,7 @@ class Machine:
         self.session: dict[str, Any] | None = None
         self.roles: dict[str, str] = {}
         self._guarded = False
+        self._entry: int | None = None  # this block's line in the run's manifest
 
     def __repr__(self) -> str:
         return f"Machine({self.public_id or self.target!r}, kind={self.kind!r}, held={self.held})"
@@ -370,12 +462,14 @@ class Machine:
         live = machine is not None and machine.get("kind") == "live"
         if live and not self.lab._is_run_machine(machine):
             self._use(machine)  # not held: the member or the conversation holds a live machine
+            self.lab._used(self, held=False)
             return self
         self._guarded = stop.hold()  # SIGTERM and SIGINT from here on release what is held
         try:
             self._hold(live)
             held = machine if live else _find(machines, self.id)
             self._use(held or self.lab.request("GET", f"/v1/machines/{_seg(self.id)}"))
+            self._entry = self.lab._used(self, held=True)
         except BaseException:
             try:
                 self.release(reason=self._reason("qupai-lab: could not start the block"), quiet=True)
@@ -400,6 +494,8 @@ class Machine:
         if not self.held or self.id is None:
             return None
         self.held = False
+        if self._entry is not None and self.lab.run_folder is not None:
+            self.lab.run_folder.released(self._entry)
         if getattr(self, "taken", False):
             _say(f"{self.public_id or self.id} stays held: the run used its member's own session")
             if self.lab.run_id:

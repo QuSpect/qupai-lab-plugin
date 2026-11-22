@@ -43,11 +43,12 @@ a local key: `Lab("http://127.0.0.1:59220", "ick_…")`.
 import sys
 from qupai_lab import Lab
 
-lab = Lab.from_env(record="calls.jsonl")
+lab = Lab.from_env(record="calls.jsonl")      # this run's folder: <experiment>/runs/<id>/
+sweep = lab.input("sweep.json")                # inputs/sweep.json: {"frequencies_hz": [100, 300, …]}
 with lab.machine(sys.argv[1]) as m:            # a pool: holds a free copy, or waits in its queue for one
     gen, scope = m.role("generator"), m.role("scope")
     rows = []
-    for f in [100, 300, 1e3, 3e3, 1e4, 3e4, 1e5]:
+    for f in sweep["frequencies_hz"]:
         gen.write("set_waveform", channel=1, shape="sine", frequency_hz=f, amplitude_v=1.0)
         scope.write("set_timebase", scale_s=0.5 / f, offset_s=0.0)
         trace = scope.read("acquire", channel=1, points=2000)
@@ -56,7 +57,7 @@ lab.table("data/response.csv", rows)
 lab.changes("changes.json")                    # the writes above, for a live run's card
 ```
 
-`python run.py signal-bench-sim` runs it on a simulated copy. The roles are the machine's: `qupai-lab machines`
+`python run.py signal-bench-sim` runs it on a simulated copy; its files land in its own run folder (below). The roles are the machine's: `qupai-lab machines`
 lists them. A script addresses instruments by role, so the same script works on any copy of a pool and on the
 machine the pool simulates, when their roles have the same names.
 
@@ -73,7 +74,51 @@ machine the pool simulates, when their roles have the same names.
 | `lab.save(path, value, **meta)` | Writes `value` as JSON (folders made as needed); answers `{"file": path, **meta}` |
 | `lab.table(path, rows)` | Writes a list of dicts as CSV; answers `{"file": path, "rows": n}` |
 | `lab.changes(path)` | Writes the writes made through this `Lab` as JSON (below) and answers it |
+| `lab.input(name)` | `inputs/<name>` of the experiment: parsed when it is `.json`, else its text |
+| `lab.out`, `lab.experiment`, `lab.inputs` | This run's folder, the experiment's folder, its `inputs/` (paths) |
 | `lab.request(method, path, body)` | Any other InstruCore route, with the same headers, record and errors |
+
+## Where a script's outputs go
+
+Each execution of an experiment's script has its own **run folder**, `<experiment>/runs/<id>/`. A live run's id is
+its job; a rehearsal's is the UTC time it started and four random hex digits (`20261122-021116-a3f9`), so the
+folders sort by time. `Lab.from_env()` makes it for a script run as `python run.py …`, at the script's first call
+or output, and a relative path given to `record`, `lab.save`, `lab.table` or `lab.changes` is inside it. The
+experiment's own folder keeps only what a person writes, and the latest rehearsal's `changes.json`, which a live
+run's card reads:
+
+```
+experiments/
+├── INDEX.md                          every experiment and its runs, from their manifests (written, not edited)
+└── 2026-11-22-freq-response/
+    ├── README.md                     what was asked, why, how to run it again, what the runs found
+    ├── run.py                        the steps: python run.py <machine>
+    ├── analysis.py                   tables and figures of one run: python analysis.py runs/<id>
+    ├── inputs/sweep.json             the values run.py reads (lab.input)
+    ├── changes.json                  the latest rehearsal's changes: the live run's card
+    └── runs/
+        ├── 20261122-021116-a3f9/     a rehearsal, on a simulated copy
+        │   ├── manifest.json
+        │   ├── calls.jsonl  changes.json
+        │   └── data/response.csv  data/raw/ (not committed)  figures/
+        └── 01a20106-20c6-…/          a live run, its job's id: the same files
+```
+
+`manifest.json` says what ran and how it ended: `run`, `kind` (`rehearsal` or `live`), `simulated` (every machine
+held was a simulated copy), `experiment`, `script` and `script_blob` (its git blob id), `argv`, `commit` and
+`dirty` (the experiment differed from the commit, `runs/` aside), `inputs` (each file of `inputs/` with its size and
+blob id), `lab` (the listing, from a sandbox door's address; no address is kept), `machines` (each one used:
+`requested`, `machine`, `kind`, `session`, `held`, `held_at`, `released_at`), `started_at`, `ended_at`, `status`
+(`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` (a live run's),
+`calls`, `outputs` (its files, the raw ones counted in `raw_files`) and `versions`.
+
+`experiments/INDEX.md` lists each experiment (newest first, with its README's title) and each of its runs: kind,
+machine, commit (`*`: it differed), start, status and calls. A rehearsal writes it as it ends, `qupai-lab run`
+after a live run, and `qupai-lab index` on demand. A script outside a folder named `experiments` leaves it alone.
+
+`Lab.from_env(runs=False)`, or `QUPAI_LAB_RUNS=0`, makes no run folder: paths are then as given, from the working
+directory. `python -c`, the interactive interpreter and test runners get none either, and `Lab(url, key)` gets one
+only when given (`run_folder=`).
 
 ## What holds a machine
 
@@ -115,6 +160,9 @@ the rest fixed. `channel` never moves: each channel is its own change.
 
 A box reads `"ranges": {"x": [min, max], "y": [min, max]}` in place of `quantity`, `min` and `max`.
 
+With a run folder the answer starts with `run`, the run's id; a rehearsal also writes it to
+`<experiment>/changes.json`, where a live run's card reads it.
+
 Every request sends `Authorization: Bearer <key>` and `X-InstruCore-Script: <script>@<commit>`: the running
 script's path in its git repository and the short commit, so the lab's record shows the code behind each call.
 Outside a git repository the header is left out; `Lab(…, script_ref="…")` sets it, `script_ref=""` sends none.
@@ -132,14 +180,16 @@ qupai-lab run --key-file .qupai/runs/<run>/key.env --commit <sha> experiments/20
    `QUPAI_LAB_RUN_MACHINE` from the key file (`KEY=VALUE` lines) and deletes it at once, whatever it holds. The
    machine must be the one named on the command line.
 2. It checks the commit out into `/tmp/qupai-run-<run>` (`git worktree add --detach`, in the repository found from
-   the working directory). The experiment folder's committed `data/`, `figures/`, `calls.jsonl` and
-   `changes.json` (a rehearsal's) are removed from that checkout, so what the run keeps is its own.
+   the working directory). Any committed `data/`, `figures/`, `calls.jsonl` and `changes.json` beside `run.py` (a
+   rehearsal's, from before run folders) are removed from that checkout, so what the run keeps is its own.
 3. It runs `python run.py <machine>` in `<checkout>/<experiment>` with the Python it runs in, with the four
    settings in place of any other `QUPAI_*` variable and `PYTHONUNBUFFERED=1`. The script's output is the
-   command's own, as it is printed. The script's `Lab.from_env()` gets the run's key, and `lab.machine(<machine>)`
-   holds the live machine (above).
-4. When the script ends it copies the `data/`, `figures/`, `calls.jsonl` and `changes.json` the script left to
-   `<experiment>/runs/<run>/` in the repository, and removes the checkout, also when the script failed.
+   command's own, as it is printed. The script's `Lab.from_env()` gets the run's key and its run folder
+   (`runs/<run>/`), and `lab.machine(<machine>)` holds the live machine (above).
+4. When the script ends it copies the run folder, and any `data/`, `figures/`, `calls.jsonl` and `changes.json`
+   the script wrote beside `run.py` itself, to `<experiment>/runs/<run>/` in the repository. The manifest gets
+   the approved commit, the exit code and the status from it (a short one is written when the script left none),
+   `experiments/INDEX.md` is written again, and the checkout is removed, also when the script failed.
 5. It exits with the script's exit code (128 + the signal's number when a signal ended the script).
 
 SIGTERM and SIGINT are passed to the script, which releases the machine and exits; a script that has not ended
