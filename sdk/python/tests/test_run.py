@@ -139,7 +139,19 @@ def test_run_end_to_end(live: FakeInstruCore, tmp_path: Path, run_id: str, monke
 
     runs = place / EXPERIMENT / "runs" / run_id
     assert sorted(p.relative_to(runs).as_posix() for p in runs.rglob("*") if p.is_file()) == [
-        "calls.jsonl", "changes.json", "data/env.json", "figures/response.txt"]  # no rehearsal output
+        "calls.jsonl", "changes.json", "data/env.json", "figures/response.txt", "manifest.json"]  # no rehearsal output
+    manifest = json.loads((runs / "manifest.json").read_text())
+    assert {k: manifest[k] for k in ("run", "kind", "simulated", "experiment", "script", "argv", "commit", "dirty",
+                                     "status", "exit_code", "calls")} == {
+        "run": run_id, "kind": "live", "simulated": False, "experiment": EXPERIMENT, "script": "run.py",
+        "argv": ["signal-bench"], "commit": sha, "dirty": False, "status": "failed", "exit_code": 3, "calls": 1}
+    [held] = manifest["machines"]
+    assert (held["requested"], held["machine"], held["kind"], held["held"]) == ("signal-bench", "signal-bench", "live",
+                                                                              True)
+    assert held["session"] and held["released_at"]
+    assert manifest["outputs"] == ["calls.jsonl", "changes.json", "data/env.json", "figures/response.txt"]
+    index = (place / "experiments" / "INDEX.md").read_text()
+    assert f"| [{run_id}](2026-11-21-freq/runs/{run_id}/) | live | signal-bench | {sha[:7]} |" in index
     seen = json.loads((runs / "data/env.json").read_text())
     assert Path(seen["cwd"]).resolve() == (tree / EXPERIMENT).resolve()
     assert seen["argv"] == ["run.py", "signal-bench"]
@@ -162,7 +174,7 @@ def test_run_end_to_end(live: FakeInstruCore, tmp_path: Path, run_id: str, monke
     out, err = capfd.readouterr()
     assert points(out) == [("held", 1), ("calls", 1), ("held", 0)]
     assert f"run {run_id}: {EXPERIMENT}/run.py at {sha[:7]} on signal-bench" in err
-    assert (f"run {run_id}: the script exited with 3; kept data/, figures/, calls.jsonl, changes.json in "
+    assert (f"run {run_id}: the script exited with 3; kept calls.jsonl, changes.json, data/, figures/ in "
             f"{EXPERIMENT}/runs/{run_id}/") in err
 
 
@@ -173,7 +185,9 @@ def test_a_failing_script_still_leaves_its_outputs(live: FakeInstruCore, tmp_pat
     monkeypatch.chdir(place)
     assert main(argv(rel, sha)) == 1
     runs = place / EXPERIMENT / "runs" / run_id
-    assert sorted(p.name for p in runs.iterdir()) == ["calls.jsonl"]
+    assert sorted(p.name for p in runs.iterdir()) == ["calls.jsonl", "manifest.json"]
+    manifest = json.loads((runs / "manifest.json").read_text())
+    assert (manifest["status"], manifest["exit_code"]) == ("failed", 1)
     end = live.calls("POST", "/v1/machines/bench/sessions/end")
     assert [s.body["reason"] for s in end] == ["qupai-lab: the script's block raised"]
     assert "RuntimeError: the script failed" in capfd.readouterr().err
@@ -235,6 +249,8 @@ def test_sigterm_ends_the_runs_session_and_keeps_what_it_wrote(live: FakeInstruC
     assert live.sessions == {}
     recorded = lines(place / EXPERIMENT / "runs" / run_id / "calls.jsonl")
     assert recorded[-1]["path"] == "/v1/machines/bench/sessions/end" and recorded[-1]["ok"] is True
+    manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
+    assert (manifest["status"], manifest["exit_code"]) == ("stopped", 143)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signals")
@@ -260,3 +276,7 @@ def test_a_script_that_does_not_stop_is_killed_after_the_grace(fake: FakeInstruC
     assert signal.getsignal(signal.SIGTERM) == before
     assert (place / EXPERIMENT / "runs" / run_id / "data" / "started").read_text() == "1"
     assert "did not end within 0.5 s: killed" in capfd.readouterr().err
+    # A script without the SDK leaves no manifest: the runner writes a short one.
+    manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
+    assert {k: manifest[k] for k in ("run", "kind", "commit", "status", "exit_code", "outputs")} == {
+        "run": run_id, "kind": "live", "commit": sha, "status": "stopped", "exit_code": 137, "outputs": ["data/started"]}
