@@ -28,12 +28,12 @@ def test_from_env_reads_the_nearest_dotenv_up(monkeypatch: pytest.MonkeyPatch, t
     project = tmp_path / "project"
     (project / "experiments" / "2026-11-21-x").mkdir(parents=True)
     (project / ".env").write_text(
-        "# the lab project's key\nexport QUPAI_LAB_URL='http://172.17.0.1:18399/lab/lab-sim'\n"
+        "# the lab project's key\nexport QUPAI_LAB_URL='http://door.example/lab/lab-sim'\n"
         'QUPAI_LAB_KEY="qpk_near" # issued by QuPai\nOTHER=1\n'
     )
     monkeypatch.chdir(project / "experiments" / "2026-11-21-x")
     lab = Lab.from_env()
-    assert (lab.url, lab._key) == ("http://172.17.0.1:18399/lab/lab-sim", "qpk_near")
+    assert (lab.url, lab._key) == ("http://door.example/lab/lab-sim", "qpk_near")
 
 
 def test_from_env_mixes_the_environment_and_a_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

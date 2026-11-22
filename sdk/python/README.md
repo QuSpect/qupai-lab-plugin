@@ -7,23 +7,21 @@ library only.
 
 ## Install
 
-Not on PyPI yet. From a checkout of this repository:
-
 ```
-pip install ./sdk/python
+pip install qupai-lab
 ```
 
-or straight from GitHub:
+A QuPai sandbox has it already. From a checkout of this repository instead: `pip install ./sdk/python`.
 
-```
-pip install "git+https://github.com/QuSpect/qupai-lab-plugin#subdirectory=sdk/python"
-```
+**Releasing.** A tag `sdk-vX.Y.Z` on this repository, equal to `qupai_lab.__version__`, runs
+`.github/workflows/sdk-release.yml`: it tests the SDK on Python 3.10 and 3.13, builds the sdist and the wheel, checks
+the tag against them, and publishes to PyPI through Trusted Publishing (no token is kept anywhere).
 
 Then check that this sandbox (or PC) reaches its lab:
 
 ```
 $ qupai-lab machines
-Lab http://172.17.0.1:18399/lab/lab-sim
+Lab http://door.example/lab/lab-sim
 MACHINE               KIND       STATE        INSTRUMENTS BY ROLE
 signal-bench-sim      pool       3 of 4 free
   signal-bench-sim-1  simulated  free         generator=signal_bench_sim_1_generator, scope=signal_bench_sim_1_scope
