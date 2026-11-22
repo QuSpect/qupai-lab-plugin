@@ -103,7 +103,7 @@ def test_a_rehearsal_has_its_run_folder(fake: FakeInstruCore, tmp_path: Path) ->
     assert m["versions"]["qupai_lab"] == runs.__version__
 
     index = (place / "experiments" / "INDEX.md").read_text()
-    assert "| [2026-11-22-freq](2026-11-22-freq/) | Frequency response \\| signal bench | 1 rehearsal |" in index
+    assert "| 2026-11-22 | [Frequency response \\| signal bench](2026-11-22-freq/) | 1 rehearsal |" in index
     assert f"| [{out.name}](2026-11-22-freq/runs/{out.name}/) | rehearsal | {held['machine']} | {sha[:7]} |" in index
     assert "| ended | 4 |" in index
 
@@ -165,11 +165,11 @@ def test_the_index_lists_experiments_newest_first(tmp_path: Path) -> None:
     (experiments / "2026-11-20-a" / "runs" / "01a1ff07-old-job").mkdir()  # a run from before manifests
     path = runs.write_index(experiments)
     text = path.read_text()
-    assert "| [2026-11-20-a](2026-11-20-a/) |  | 1 live · 1 without a manifest |" in text
+    assert "| 2026-11-20 | [a](2026-11-20-a/) | 1 live · 1 without a manifest |" in text
     assert "| [01a1ff07-old-job](2026-11-20-a/runs/01a1ff07-old-job/) | no manifest |" in text
-    order = [text.index(f"[{n}]({n}/) |") for n in ("2026-11-23-c", "2026-11-22-b", "2026-11-20-a")]
+    order = [text.index(f"]({n}/) |") for n in ("2026-11-23-c", "2026-11-22-b", "2026-11-20-a")]
     assert order == sorted(order)
-    assert "| [2026-11-23-c](2026-11-23-c/) |  | none |  |" in text
+    assert "| 2026-11-23 | [c](2026-11-23-c/) | none |  |" in text
     assert "| [r1](2026-11-22-b/runs/r1/) | live | bench | abcdef0 | 2026-11-22 09:30 | ended, exit 0 | 7 |" in text
     before = path.stat().st_mtime_ns
     assert runs.write_index(experiments) == path and path.stat().st_mtime_ns == before  # unchanged: not rewritten
@@ -190,7 +190,22 @@ def test_the_index_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caps
     monkeypatch.chdir(tmp_path)
     assert main(["index"]) == 0
     assert capsys.readouterr().out.strip() == str(tmp_path / "experiments" / "INDEX.md")
-    assert "| [2026-11-22-a](2026-11-22-a/) |  | none |  |" in (tmp_path / "experiments" / "INDEX.md").read_text()
+    assert "| 2026-11-22 | [a](2026-11-22-a/) | none |  |" in (tmp_path / "experiments" / "INDEX.md").read_text()
     monkeypatch.chdir(tmp_path / "experiments")
     assert main(["index"]) == 0
     assert main(["index", str(tmp_path / "nowhere")]) == 1 and "no experiments in" in capsys.readouterr().err
+
+
+def test_the_index_names_an_experiment_once_with_one_date(tmp_path: Path) -> None:
+    experiments = tmp_path / "experiments"
+    for name, heading in (("2026-11-22-amplitude-linearity", "# 2026-11-22 amplitude linearity of the bench [1 kHz]"),
+                          ("2026-11-21-freq-response", "# 2026-11-21 — Frequency response"),
+                          ("2026-11-20-no-readme", None), ("scratch", "# Scratch work")):
+        (experiments / name).mkdir(parents=True)
+        if heading:
+            (experiments / name / "README.md").write_text(heading + "\n")
+    text = runs.index_text(experiments)
+    assert "| 2026-11-22 | [Amplitude linearity of the bench (1 kHz)](2026-11-22-amplitude-linearity/) | none |" in text
+    assert "| 2026-11-21 | [Frequency response](2026-11-21-freq-response/) | none |" in text
+    assert "| 2026-11-20 | [no readme](2026-11-20-no-readme/) | none |" in text
+    assert "|  | [Scratch work](scratch/) | none |" in text

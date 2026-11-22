@@ -113,7 +113,8 @@ blob id), `lab` (the listing, from a sandbox door's address; no address is kept)
 `calls`, `outputs` (the files the run itself left, the raw ones counted in `raw_files`; an analysis adds its own
 later) and `versions`.
 
-`experiments/INDEX.md` lists each experiment (newest first, with its README's title) and each of its runs: kind,
+`experiments/INDEX.md` lists each experiment (newest first: its date, from the folder's name, and its README's
+title, without a date of its own) and each of its runs: kind,
 machine, commit (`*`: it differed), start, status and calls; a run folder without a manifest (from an SDK before
 0.3.0) is listed by name. A rehearsal writes it as it ends, `qupai-lab run`
 after a live run, and `qupai-lab index` on demand. A script outside a folder named `experiments` leaves it alone.

@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import subprocess
 import sys
@@ -278,14 +279,28 @@ def _cell(value: Any) -> str:
     return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ").strip()
 
 
+_DATED = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-(.*))?$")
+_LEADING_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}\b[\s:·—–-]*")
+
+
 def _title(readme: Path) -> str:
+    """The README's first heading, without a leading date (the folder's name has it)."""
     try:
         for line in readme.read_text(encoding="utf-8").splitlines():
             if line.startswith("# "):
-                return line[2:].strip()
+                title = _LEADING_DATE.sub("", line[2:].strip())
+                return title[:1].upper() + title[1:]
     except (OSError, UnicodeDecodeError):
         pass
     return ""
+
+
+def _named(folder: Path) -> tuple[str, str]:
+    """An experiment's date (from ``<yyyy-mm-dd>-<topic>``) and what it is called: its README's title, else its
+    topic, else the folder's name."""
+    dated = _DATED.match(folder.name)
+    date, topic = (dated.group(1), (dated.group(2) or "").replace("-", " ")) if dated else ("", folder.name)
+    return date, _title(folder / "README.md") or topic or folder.name
 
 
 def _when(iso: Any) -> str:
@@ -332,7 +347,7 @@ def index_text(experiments: Path) -> str | None:
         return None
     about = ("Written by `qupai-lab index` from each run's `manifest.json`; an edit here is replaced. A rehearsal runs "
              "on simulated copies, a live run on the machine; `*` after a commit: the experiment differed from it.")
-    head = ["# Experiments", "", about, "", "| Experiment | What | Runs | Last run |", "|---|---|---|---|"]
+    head = ["# Experiments", "", about, "", "| Date | Experiment | Runs | Last run |", "|---|---|---|---|"]
     body: list[str] = []
     for folder in folders:
         runs, bare = _manifests(folder), _unrecorded(folder)
@@ -343,11 +358,13 @@ def index_text(experiments: Path) -> str | None:
                                          f"{len(bare)} without a manifest" if bare else "") if x) or "none"
         last = runs[0] if runs else None
         last_text = f"{_when(last.get('started_at'))} {last.get('kind')}, {_status(last)}" if last else ""
-        link = f"[{folder.name}]({folder.name}/)"
-        head.append(f"| {link} | {_cell(_title(folder / 'README.md'))} | {counts} | {_cell(last_text)} |")
+        date, name = _named(folder)
+        link = f"[{_cell(name).replace('[', '(').replace(']', ')')}]({folder.name}/)"
+        head.append(f"| {date} | {link} | {counts} | {_cell(last_text)} |")
         if not runs and not bare:
             continue
-        body += ["", f"## {link}", "", "| Run | Kind | Machine | Commit | Started (UTC) | Status | Calls |",
+        body += ["", f"## {link}" + (f" · {date}" if date else ""), "",
+                 "| Run | Kind | Machine | Commit | Started (UTC) | Status | Calls |",
                  "|---|---|---|---|---|---|---|"]
         for m in runs:
             run = str(m.get("run"))
