@@ -21,6 +21,7 @@ with warnings.catch_warnings():
 
 PREFIX = "/lab/lab-test"
 DEVICE = "moku_go"
+COPY = "signal-bench-sim-1"  # the copy the pool gives first, by its public id
 
 
 @pytest.fixture
@@ -41,8 +42,9 @@ def test_an_oscilloscope_through_the_lab(door: FakeInstruCore, tmp_path: Path) -
             data = osc.get_data()
     assert data["ch1"] == [0.0, 0.5, 1.0]
 
-    # http://{ip}/api/… is <QUPAI_LAB_URL>/v1/moku/<device>/api/…, with the lab's path prefix.
-    base = f"{PREFIX}/v1/moku/{DEVICE}/api"
+    # http://{ip}/api/… is <QUPAI_LAB_URL>/v1/moku/<machine>/<device>/api/…, with the lab's path prefix and the copy
+    # the block holds.
+    base = f"{PREFIX}/v1/moku/{COPY}/{DEVICE}/api"
     calls = moku_calls(door)
     assert [(s.method, s.full_path) for s in calls] == [
         ("POST", f"{base}/moku/claim_ownership"),
@@ -80,7 +82,7 @@ def test_a_spectrum_analyzer_in_multi_instrument_mode(door: FakeInstruCore) -> N
         mim.relinquish_ownership()
     assert data["ch2"] == [1.0, 0.5, 0.0]
     calls = moku_calls(door)
-    assert all(s.path.startswith("/v1/moku/moku_pro/api/") for s in calls)
+    assert all(s.path.startswith(f"/v1/moku/{COPY}/moku_pro/api/") for s in calls)
     assert [(s.method, s.path.split("/api/", 1)[1]) for s in calls] == [
         ("POST", "moku/claim_ownership"),
         ("GET", "moku/describe"),
@@ -93,6 +95,16 @@ def test_a_spectrum_analyzer_in_multi_instrument_mode(door: FakeInstruCore) -> N
     ]
     assert calls[5].body == {"strict": True, "frequency1": 0, "frequency2": 10e6}
     assert "X-InstruCore-Script" not in calls[0].headers  # script_ref="": none, as on the Lab's own calls
+
+
+def test_the_calls_name_the_copy_actually_held(door: FakeInstruCore) -> None:
+    door.sessions["signal_bench_sim_1"] = {"session_id": "s_other"}  # someone else holds the first copy
+    lab = Lab(door.url, "qpk_test", script_ref="")
+    with lab.machine("signal-bench-sim") as m:
+        with instruments.Oscilloscope(**m.moku(DEVICE)) as osc:
+            osc.get_data()
+    calls = moku_calls(door)
+    assert calls and all(s.path.startswith(f"/v1/moku/signal-bench-sim-2/{DEVICE}/api/") for s in calls)
 
 
 def test_each_instrument_starts_without_the_last_ones_client_key(door: FakeInstruCore) -> None:

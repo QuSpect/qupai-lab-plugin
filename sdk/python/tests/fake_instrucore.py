@@ -4,8 +4,8 @@
 A key in ``run_keys`` is a live run's (InstruCore 0.21.0's ``lab_run`` claim on the bench): it may start a
 session on the bench with the queue on, and write there while it holds it.
 
-``/v1/moku/<device>/api/<group>/<operation>`` stands in for InstruCore's copy of a Moku's own HTTP API (the
-endpoint for the official moku package): the Moku's answers in its own envelope (``success``, ``data``,
+``/v1/moku/<machine>/<device>/api/<group>/<operation>`` stands in for InstruCore's copy of a Moku's own HTTP API
+(the endpoint for the official moku package), on a machine the fake knows: the Moku's answers in its own envelope (``success``, ``data``,
 ``messages``, ``code``) and a ``Moku-Client-Key`` with the claim. ``prefix`` mounts the lab under a path, as a
 QuPai sandbox's door does (``/lab/<listing>``)."""
 
@@ -173,8 +173,10 @@ class FakeInstruCore:
             return 200, r
         if method == "POST" and len(rest) == 4 and rest[0] == "instruments":
             return self._op(rest[1], rest[2], rest[3], body or {})
-        if len(rest) >= 4 and rest[0] == "moku" and rest[2] == "api":
-            return self._moku(method, "/".join(rest[3:]), body)
+        if len(rest) >= 5 and rest[0] == "moku" and rest[3] == "api":
+            if _internal(rest[1]) not in ("bench", *COPIES):
+                return 404, _err("NOT_FOUND", f"机器 {rest[1]} 不存在", resource="machine")
+            return self._moku(method, "/".join(rest[4:]), body)
         return 404, _err("NOT_FOUND", f"no route {method} {path}")
 
     def _moku(self, method: str, op: str, body: Any) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:

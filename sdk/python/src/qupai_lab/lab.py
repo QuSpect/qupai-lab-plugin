@@ -37,9 +37,10 @@ POLL_S = 2.0
 POLL_MAX_S = 15.0
 CALLS_EVERY_S = 5.0  # inside a run, the ``calls`` point at most this often
 _GONE = ("cancelled", "expired")  # a queue request that ended this way is never offered
-# A Moku's device id as InstruCore writes ids (``moku_pro``) and public ids (``moku-go``): it goes into the official
-# moku package's address unescaped, so it may not carry a ``/``, a ``.`` or anything else that changes the route.
-_MOKU_DEVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+# A machine's and a Moku's id as InstruCore writes ids (``moku_pro``) and public ids (``moku-bench-sim-1``): they go
+# into the official moku package's address unescaped, so they may not carry a ``/``, a ``.`` or anything else that
+# changes the route.
+_MOKU_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 def _seg(value: Any) -> str:
@@ -47,16 +48,23 @@ def _seg(value: Any) -> str:
     return quote(str(value), safe="")
 
 
-def moku_address(url: str, device_id: Any) -> str:
-    """The ``ip`` the official moku package gets for the Moku ``device_id`` of the lab at ``url``: the address
-    without ``http://``, and ``/v1/moku/<device_id>``. The package builds ``http://{ip}/api/<group>/<operation>``,
-    so its calls reach ``<url>/v1/moku/<device_id>/api/…``, InstruCore's copy of the Moku's own HTTP API."""
-    if not isinstance(device_id, str) or not _MOKU_DEVICE.fullmatch(device_id):
+def _plain_id(value: Any, kind: str, what: str) -> None:
+    """Refuses (``INVALID_MACHINE``, ``INVALID_DEVICE``) an id that could change the official package's route."""
+    if not isinstance(value, str) or not _MOKU_ID.fullmatch(value):
         raise LabError(
-            "INVALID_DEVICE",
-            f"{device_id!r} is not a Moku's device id: letters, digits, '_' and '-', at most 64, as the lab names it",
-            {"device": device_id if isinstance(device_id, str) else repr(device_id)},
+            f"INVALID_{kind.upper()}",
+            f"{value!r} is not {what}: letters, digits, '_' and '-', at most 64, as the lab names it",
+            {kind: value if isinstance(value, str) else repr(value)},
         )
+
+
+def moku_address(url: str, machine_id: Any, device_id: Any) -> str:
+    """The ``ip`` the official moku package gets for the Moku ``device_id`` of the machine ``machine_id`` (the live
+    machine, or the simulated copy held) of the lab at ``url``: the address without ``http://``, and
+    ``/v1/moku/<machine_id>/<device_id>``. The package builds ``http://{ip}/api/<group>/<operation>``, so its calls
+    reach ``<url>/v1/moku/<machine_id>/<device_id>/api/…``, InstruCore's copy of the Moku's own HTTP API."""
+    _plain_id(machine_id, "machine", "a machine's id")
+    _plain_id(device_id, "device", "a Moku's device id")
     parts = urlsplit(url)
     if parts.scheme == "https":
         raise LabError(
@@ -72,7 +80,7 @@ def moku_address(url: str, device_id: Any) -> str:
             "package needs",
             {"url": url},
         )
-    return f"{parts.netloc}{parts.path.rstrip('/')}/v1/moku/{device_id}"
+    return f"{parts.netloc}{parts.path.rstrip('/')}/v1/moku/{machine_id}/{device_id}"
 
 
 def _installed(package: str) -> str | None:
@@ -724,14 +732,15 @@ class Machine:
                     sa.set_span(frequency1=0, frequency2=10e6)
                     data = sa.get_data()
 
-        ``ip``: the lab's address without ``http://`` and ``/v1/moku/<device_id>``, where InstruCore answers the
-        Moku's own HTTP API behind its checks. ``session_headers``: this Lab's key and script header, a new dict
+        ``ip``: the lab's address without ``http://`` and ``/v1/moku/<machine>/<device_id>``, where InstruCore
+        answers the Moku's own HTTP API behind its checks; ``<machine>`` is this machine's public id, as
+        ``lab.machines()`` lists it: the live machine, or the simulated copy the block holds. ``session_headers``: this Lab's key and script header, a new dict
         each call. ``manage_bitstreams=False``: InstruCore uploads what the Moku lacks on the lab PC. Nothing is
         called here; the package's own calls go to the lab, which records each, and the run's manifest notes the
         device (``official_sdk``). ``moku`` is not a dependency of qupai-lab (``qupai-lab[moku]`` installs it)."""
         if self.kind is None:
             raise LabError("NOT_HELD", f"use the machine in a block first: with lab.machine({self.target!r}) as m")
-        ip = moku_address(self.lab.url, device_id)
+        ip = moku_address(self.lab.url, self.public_id or self.id, device_id)
         version = _installed("moku")
         args = {
             "ip": ip,

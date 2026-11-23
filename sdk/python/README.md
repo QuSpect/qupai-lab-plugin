@@ -175,7 +175,7 @@ nothing; it answers three arguments:
 
 | Argument | Value |
 | --- | --- |
-| `ip` | The lab's address without `http://`, then `/v1/moku/<device>`. The package builds `http://{ip}/api/<group>/<operation>`, so its calls reach `<QUPAI_LAB_URL>/v1/moku/<device>/api/…`, where InstruCore answers the Moku's own HTTP API behind its checks |
+| `ip` | The lab's address without `http://`, then `/v1/moku/<machine>/<device>`. `<machine>` is the machine in the block by its public id, as `lab.machines()` lists it: the live machine, or the simulated copy the block holds, so the same script reaches the copy in a rehearsal and the live Moku in a run. The package builds `http://{ip}/api/<group>/<operation>`, so its calls reach `<QUPAI_LAB_URL>/v1/moku/<machine>/<device>/api/…`, where InstruCore answers that Moku's own HTTP API behind its checks |
 | `session_headers` | The headers of this `Lab`'s own calls: `Authorization: Bearer <key>`, `X-InstruCore-Script` (when the script has one) and `User-Agent`. The package makes them its HTTP session's headers and adds its `Moku-Client-Key`, so each call gives a new dict |
 | `manage_bitstreams` | `False`: the package uploads no FPGA bitstreams, since InstruCore uploads what the Moku lacks at the lab PC |
 
@@ -191,13 +191,13 @@ nothing; it answers three arguments:
   `calls` and `lab.changes()` count and list this SDK's own calls only; the manifest's `official_sdk` (and
   `changes.json`, when there is any) names each device worked this way: `package`, `version`, `machine`, `device`.
 - **http only.** The package builds `http://` URLs itself, so the lab must be at an http address, as a QuPai
-  sandbox's door is; an https address raises `LabError` `HTTP_ONLY`. A device id is letters, digits, `_` and `-`
-  (`INVALID_DEVICE` otherwise).
+  sandbox's door is; an https address raises `LabError` `HTTP_ONLY`. A machine's and a device's id are letters,
+  digits, `_` and `-` (`INVALID_MACHINE`, `INVALID_DEVICE` otherwise).
 - **Not through the lab:** streaming (`start_streaming`, `get_stream_data`, `stream_to_file`) runs the
   manufacturer's `mokucli` against the device itself. `import moku` warns that it cannot find `mokucli`; nothing
   above needs it.
 - The package's other arguments keep their defaults and may be given beside: `SpectrumAnalyzer(**m.moku("moku"),
-  read_timeout=60)`. The lab needs an InstruCore that offers `/v1/moku/<device>`; an older one answers `404`, which
+  read_timeout=60)`. The lab needs an InstruCore that offers `/v1/moku/<machine>/<device>`; an older one answers `404`, which
   the package reports as "Method not found".
 
 `moku` is not a dependency of `qupai-lab`, which only builds its arguments: a QuPai sandbox has it, and
@@ -301,7 +301,7 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |
-| `INVALID_DEVICE`, `HTTP_ONLY` | `m.moku()`'s own: not a plain device id; the lab's address is not plain http, which the official `moku` package needs |
+| `INVALID_MACHINE`, `INVALID_DEVICE`, `HTTP_ONLY` | `m.moku()`'s own: not a plain machine or device id; the lab's address is not plain http, which the official `moku` package needs |
 
 ## Tests
 
