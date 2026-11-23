@@ -19,6 +19,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+# The manufacturer's own Python package for a Moku, at the version m.moku() is tested with. qupai-lab only builds
+# its arguments and never imports it.
+moku = ["moku==4.3.0.1"]
+
 [project.urls]
 Homepage = "https://github.com/QuSpect/qupai-lab-plugin"
 Repository = "https://github.com/QuSpect/qupai-lab-plugin"

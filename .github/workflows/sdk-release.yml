@@ -25,10 +25,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      # With the moku extra, so the test that drives the official moku package through m.moku() runs too.
       - name: Test
         working-directory: sdk/python
         run: |
-          python -m pip install -e . pytest
+          python -m pip install -e ".[moku]" pytest
           python -m pytest -q
 
   build:

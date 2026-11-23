@@ -6,8 +6,10 @@ from __future__ import annotations
 import atexit
 import csv
 import email.utils
+import importlib.metadata
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -17,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from qupai_lab import __version__, config, metric, stop
 from qupai_lab import changes as _changes
@@ -35,11 +37,58 @@ POLL_S = 2.0
 POLL_MAX_S = 15.0
 CALLS_EVERY_S = 5.0  # inside a run, the ``calls`` point at most this often
 _GONE = ("cancelled", "expired")  # a queue request that ended this way is never offered
+# A machine's and a Moku's id as InstruCore writes ids (``moku_pro``) and public ids (``moku-bench-sim-1``): they go
+# into the official moku package's address unescaped, so they may not carry a ``/``, a ``.`` or anything else that
+# changes the route.
+_MOKU_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 def _seg(value: Any) -> str:
     """One path segment, escaped: an id or an op cannot turn into another route."""
     return quote(str(value), safe="")
+
+
+def _plain_id(value: Any, kind: str, what: str) -> None:
+    """Refuses (``INVALID_MACHINE``, ``INVALID_DEVICE``) an id that could change the official package's route."""
+    if not isinstance(value, str) or not _MOKU_ID.fullmatch(value):
+        raise LabError(
+            f"INVALID_{kind.upper()}",
+            f"{value!r} is not {what}: letters, digits, '_' and '-', at most 64, as the lab names it",
+            {kind: value if isinstance(value, str) else repr(value)},
+        )
+
+
+def moku_address(url: str, machine_id: Any, device_id: Any) -> str:
+    """The ``ip`` the official moku package gets for the Moku ``device_id`` of the machine ``machine_id`` (the live
+    machine, or the simulated copy held) of the lab at ``url``: the address without ``http://``, and
+    ``/v1/moku/<machine_id>/<device_id>``. The package builds ``http://{ip}/api/<group>/<operation>``, so its calls
+    reach ``<url>/v1/moku/<machine_id>/<device_id>/api/…``, InstruCore's copy of the Moku's own HTTP API."""
+    _plain_id(machine_id, "machine", "a machine's id")
+    _plain_id(device_id, "device", "a Moku's device id")
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        raise LabError(
+            "HTTP_ONLY",
+            f"the lab's address is https ({url}), and the official moku package speaks http only (it builds "
+            "http://<ip>/api/… itself): reach the lab at an http address, as a QuPai sandbox's door is",
+            {"url": url},
+        )
+    if parts.scheme != "http" or not parts.netloc or parts.query or parts.fragment:
+        raise LabError(
+            "HTTP_ONLY",
+            f"the lab's address {url!r} is not an http://host[:port][/path] address, which the official moku "
+            "package needs",
+            {"url": url},
+        )
+    return f"{parts.netloc}{parts.path.rstrip('/')}/v1/moku/{machine_id}/{device_id}"
+
+
+def _installed(package: str) -> str | None:
+    """The installed version of ``package``, without importing it; None when it is not installed."""
+    try:
+        return importlib.metadata.version(package)
+    except (importlib.metadata.PackageNotFoundError, ValueError, OSError):
+        return None
 
 
 def _retry_after(value: str | None) -> float:
@@ -107,6 +156,8 @@ class Lab:
         self._sleep: Callable[[float], None] = time.sleep
         self._writes: list[_changes.Write] = []
         self._machines_used: list[str] = []
+        # Devices worked with a manufacturer's own SDK (``Machine.moku``): its calls go to the lab, not through here.
+        self._official_used: list[dict[str, Any]] = []
         # Inside a live run (``qupai-lab run``): its id, and the live machine ``machine()`` holds for it.
         self.run_id, self.run_machine = config.run()
         self._calls = 0
@@ -234,6 +285,26 @@ class Lab:
         if self.script_ref:
             headers["X-InstruCore-Script"] = self.script_ref
         return headers
+
+    def _official_headers(self, package: str, version: str | None) -> dict[str, str]:
+        """The headers of a manufacturer's SDK's calls through this Lab: this Lab's own key and script header (the
+        key is what tells the lab whose hold a call is in), without ``Accept: application/json``, since such an SDK
+        also fetches files. A new dict each time: the official moku package makes it its HTTP session's headers and
+        adds its ``Moku-Client-Key`` to it."""
+        headers = self._headers(body=False)
+        del headers["Accept"]
+        headers["User-Agent"] += f" {package}/{version}" if version else f" {package}"
+        return headers
+
+    def _official(self, package: str, version: str | None, m: Machine, device: str) -> None:
+        """Notes in the run that ``package`` works ``device`` on ``m``: the lab records each of its calls; the
+        record file, ``calls`` and ``changes`` here see none of them."""
+        entry = {"package": package, "version": version, "machine": m.public_id or m.id, "device": device}
+        if entry in self._official_used:
+            return
+        self._official_used.append(entry)
+        if self.run_folder is not None:
+            self.run_folder.official(entry)
 
     def _send(self, method: str, path: str, body: dict[str, Any] | None) -> _Answer:
         data = dumps(body).encode("utf-8") if body is not None else None
@@ -379,6 +450,8 @@ class Lab:
             # run.py's git blob id as it ran: the live run's card says rehearsed when its commit has this file.
             "script_blob": config.running_script_blob(),
             "machines": list(self._machines_used),
+            # A device the script worked with a manufacturer's SDK (m.moku): its writes are not among the changes.
+            **({"official_sdk": [dict(e) for e in self._official_used]} if self._official_used else {}),
             "written_at": now_iso(),
             "changes": _changes.group(self._writes),
         }
@@ -648,6 +721,34 @@ class Machine:
                 {"machine": self.public_id, "role": name, "roles": list(self.roles)},
             )
         return Instrument(self, name, self.roles[name])
+
+    def moku(self, device_id: str) -> dict[str, Any]:
+        """Keyword arguments for the official ``moku`` package on the Moku ``device_id`` of this machine, through the
+        lab: any of its instruments, ``MultiInstrument`` and ``Moku`` take them, as at the device::
+
+            from moku.instruments import SpectrumAnalyzer
+            with lab.machine(sys.argv[1]) as m:
+                with SpectrumAnalyzer(**m.moku("moku")) as sa:
+                    sa.set_span(frequency1=0, frequency2=10e6)
+                    data = sa.get_data()
+
+        ``ip``: the lab's address without ``http://`` and ``/v1/moku/<machine>/<device_id>``, where InstruCore
+        answers the Moku's own HTTP API behind its checks; ``<machine>`` is this machine's public id, as
+        ``lab.machines()`` lists it: the live machine, or the simulated copy the block holds. ``session_headers``: this Lab's key and script header, a new dict
+        each call. ``manage_bitstreams=False``: InstruCore uploads what the Moku lacks on the lab PC. Nothing is
+        called here; the package's own calls go to the lab, which records each, and the run's manifest notes the
+        device (``official_sdk``). ``moku`` is not a dependency of qupai-lab (``qupai-lab[moku]`` installs it)."""
+        if self.kind is None:
+            raise LabError("NOT_HELD", f"use the machine in a block first: with lab.machine({self.target!r}) as m")
+        ip = moku_address(self.lab.url, self.public_id or self.id, device_id)
+        version = _installed("moku")
+        args = {
+            "ip": ip,
+            "session_headers": self.lab._official_headers("moku", version),
+            "manage_bitstreams": False,
+        }
+        self.lab._official("moku", version, self, device_id)
+        return args
 
     def reference(self) -> dict[str, Any]:
         """The machine's reference document (``mhs-reference/0``): roles, wiring, session settings, and each

@@ -2,11 +2,17 @@
 (src/instrucore/api/machines.py, api/instruments.py): a live bench and a pool of two simulated copies.
 
 A key in ``run_keys`` is a live run's (InstruCore 0.21.0's ``lab_run`` claim on the bench): it may start a
-session on the bench with the queue on, and write there while it holds it."""
+session on the bench with the queue on, and write there while it holds it.
+
+``/v1/moku/<machine>/<device>/api/<group>/<operation>`` stands in for InstruCore's copy of a Moku's own HTTP API
+(the endpoint for the official moku package), on a machine the fake knows: the Moku's answers in its own envelope (``success``, ``data``,
+``messages``, ``code``) and a ``Moku-Client-Key`` with the claim. ``prefix`` mounts the lab under a path, as a
+QuPai sandbox's door does (``/lab/<listing>``)."""
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,6 +23,8 @@ ROLES = ("dg822_pro_usb", "tbs1104_usb")
 POOL = "signal_bench_sim"
 POOL_PUBLIC = "signal-bench-sim"
 COPIES = ("signal_bench_sim_1", "signal_bench_sim_2")
+MOKU_CLIENT_KEY = "fake-moku-client-key"
+MOKU_DESCRIBE = {"hardware": "Moku:Go", "mokuOS": "4.3.0", "proxy_version": 2, "bitstreams": {}}
 
 
 def _instrument_ids(machine: str) -> dict[str, str]:
@@ -26,9 +34,10 @@ def _instrument_ids(machine: str) -> dict[str, str]:
 @dataclass
 class Seen:
     method: str
-    path: str
+    path: str  # without the fake's prefix
     headers: Any  # http.client.HTTPMessage: names are case-insensitive
     body: Any
+    full_path: str = ""  # as it came, with the prefix
 
 
 @dataclass
@@ -43,7 +52,8 @@ class Canned:
 
 
 class FakeInstruCore:
-    def __init__(self) -> None:
+    def __init__(self, prefix: str = "") -> None:
+        self.prefix = prefix.rstrip("/")
         self.seen: list[Seen] = []
         self.canned: list[Canned] = []
         self.sessions: dict[str, dict[str, Any]] = {}  # copy id → session
@@ -53,10 +63,11 @@ class FakeInstruCore:
         self.taken = False
         self.run_keys: set[str] = set()  # keys of live runs on the bench
         self.before: dict[tuple[str, str], Callable[[], None]] = {}  # called as that request arrives
+        self.moku_refusal: str | None = None  # set: every Moku call is refused with it, in the Moku's envelope
         self.lock = threading.Lock()
         self._n = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}{self.prefix}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self) -> FakeInstruCore:
@@ -162,7 +173,37 @@ class FakeInstruCore:
             return 200, r
         if method == "POST" and len(rest) == 4 and rest[0] == "instruments":
             return self._op(rest[1], rest[2], rest[3], body or {})
+        if len(rest) >= 5 and rest[0] == "moku" and rest[3] == "api":
+            if _internal(rest[1]) not in ("bench", *COPIES):
+                return 404, _err("NOT_FOUND", f"机器 {rest[1]} 不存在", resource="machine")
+            return self._moku(method, "/".join(rest[4:]), body)
         return 404, _err("NOT_FOUND", f"no route {method} {path}")
+
+    def _moku(self, method: str, op: str, body: Any) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
+        """A Moku's own answers for the calls the tests make; an operation it does not know is a 404, as on a
+        Moku."""
+        def ok(data: Any) -> tuple[int, Any]:
+            return 200, {"success": True, "data": data, "messages": [], "code": None}
+
+        if self.moku_refusal is not None:
+            return 200, {"success": False, "data": None, "messages": [self.moku_refusal], "code": "SESSION_REQUIRED"}
+        if (method, op) == ("POST", "moku/claim_ownership"):
+            return (*ok("Ownership claimed"), {"Moku-Client-Key": MOKU_CLIENT_KEY})
+        if (method, op) == ("POST", "moku/relinquish_ownership"):
+            return ok("Ownership relinquished")
+        if (method, op) == ("GET", "moku/describe"):
+            return ok(MOKU_DESCRIBE)
+        if method == "GET" and re.fullmatch(r"moku/platform/\d+", op):
+            return ok(f"Platform {op.rsplit('/', 1)[-1]} deployed")
+        if (method, op) == ("GET", "mim/get_instruments"):
+            return ok(["", "", "", ""])
+        if method == "GET" and re.fullmatch(r"slot\d+/\w+", op):
+            return ok(f"{op.split('/')[1]} deployed")
+        if method == "POST" and op.endswith("/get_data"):
+            return ok({"ch1": [0.0, 0.5, 1.0], "ch2": [1.0, 0.5, 0.0], "time": [0.0, 1e-6, 2e-6]})
+        if method == "POST" and re.fullmatch(r"slot\d+/\w+/\w+", op):
+            return ok({"op": op, "args": body})
+        return 404, b""
 
     def _start(self, target: str, body: dict[str, Any], key: str = "") -> tuple[int, Any]:
         if target not in (POOL, "bench", *COPIES):
@@ -235,22 +276,28 @@ class FakeInstruCore:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b""
                 body = json.loads(raw) if raw else None
-                hook = fake.before.get((self.command, self.path))
+                full = self.path
+                path = full[len(fake.prefix):] if full.startswith(fake.prefix + "/") else full
+                hook = fake.before.get((self.command, path))
                 if hook is not None:
                     hook()
                 with fake.lock:
-                    fake.seen.append(Seen(self.command, self.path, self.headers, body))
-                    canned = next((c for c in fake.canned if c.method == self.command and c.path == self.path), None)
+                    fake.seen.append(Seen(self.command, path, self.headers, body, full))
+                    canned = next((c for c in fake.canned if c.method == self.command and c.path == path), None)
                     if canned is not None:
                         canned.times -= 1
                         if canned.times <= 0:
                             fake.canned.remove(canned)
                         status, out, headers, ctype = canned.status, canned.body, canned.headers, canned.content_type
+                    elif fake.prefix and path == full:
+                        status, out = 404, _err("NOT_FOUND", "not under the prefix")
+                        headers, ctype = {}, "application/json"
                     else:
                         auth = self.headers.get("Authorization") or ""
                         key = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
-                        status, out = fake.route(self.command, self.path, body, key)
-                        headers, ctype = {}, "application/json"
+                        answer = fake.route(self.command, path, body, key)
+                        status, out = answer[0], answer[1]
+                        headers, ctype = (answer[2] if len(answer) > 2 else {}), "application/json"
                 data = out if isinstance(out, bytes) else json.dumps(out).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
