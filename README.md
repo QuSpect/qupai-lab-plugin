@@ -5,9 +5,9 @@ says how to operate them safely, and one command that opens the lab's live page.
 
 | Part | What it is |
 | --- | --- |
-| The `lab` tools | Your lab through QuPai's gateway: `machines`, `describe`, `read`, `write`, `sweep`, sessions, simulated copies. QuPai checks your role on the lab and the lab's limits on every call |
+| The `lab` tools | Your lab through QuPai's gateway: `machines`, `describe`, `read`, `write`, `sweep`, sessions, simulated copies. QuPai and the lab check your role on each bench and the lab's limits on every call |
 | `lab-operator` skill | How Claude works on a lab: look first, rehearse on a simulated copy, ask before writing to a real machine, never get around a limit, stop and tell you when something looks wrong |
-| `/qupai-lab:watch` | Opens the lab's live page (Instruments, live) in your browser |
+| `/qupai-lab:watch` | Opens the lab's live page (Instruments, live) in your browser; `/qupai-lab:watch <bench>` opens one bench |
 | The Lab SDK | `qupai-lab`, a Python package in [`sdk/python`](sdk/python/README.md) for scripts that work the lab through InstruCore's REST API: simulated copies held for a block, instruments by role, a record of every call, the changes for a live run's card, and live runs in the lab's queue (`qupai-lab run`) |
 
 ## Install
@@ -40,10 +40,13 @@ Claude Code keeps the sign-in; QuPai decides what it allows.
 
 ## What Claude can do there
 
-What your role on the lab allows: with view, everything on the simulated copies and reading and watching the real
-machines; with operate, also holding a real machine and writing to it, which is also how an instrument is turned off:
-InstruCore has no machine-wide stop. The lab's admin may hold agents
-outside QuPai, such as Claude Code, to view. Every call shows on the lab's live page, marked as an agent's.
+One lab PC may serve several benches of the lab, each a real machine of its own with its own instruments: `machines`
+lists them by id (a lab with one bench calls it `bench`), and Claude names the one it works on. Your role is per
+bench, as the lab's admin set it: on a bench where you hold view, everything on its simulated copies and reading and
+watching the real machine; with operate, also holding it and writing to it, which is also how an instrument is
+turned off: InstruCore has no machine-wide stop. A bench you hold no role on is not there for you. The lab's admin
+may hold agents outside QuPai, such as Claude Code, to view. Every call shows on the lab's live page, marked as an
+agent's.
 
 ## Privacy
 
