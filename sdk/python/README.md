@@ -72,6 +72,7 @@ the key's member holds a role on; another bench answers `NOT_FOUND`.
 | `lab.machines()` | Each live machine (a bench) and simulated copy the member may see: `id` (public id), `internal_id`, `name`, `kind`, `state`, `status`, `pool`, `roles` (role → instrument id) |
 | `lab.machine(id, *, purpose="", wait_s=None)` | A machine for a `with` block (below), by id or public id; there is no default |
 | `m.role(name)` | The instrument in that role |
+| `m.moku(device)` | The keyword arguments for the official `moku` package on that Moku of the machine, through the lab ([below](#a-moku-with-the-official-sdk)) |
 | `inst.read(op, **args)` | A read op; answers its result. Anyone may read |
 | `inst.write(op, **args)` | A write op in the machine's session; the lab checks its limits first |
 | `inst.check(op, **args)` | Would this write pass policy, arguments and limits? `{"ok": true, "kind": "write"}` or the refusal, without a session |
@@ -114,7 +115,9 @@ experiments/
 held was a simulated copy), `experiment`, `script` and `script_blob` (its git blob id), `argv`, `commit` and
 `dirty` (the experiment differed from the commit, `runs/` aside), `inputs` (each file of `inputs/` with its size and
 blob id), `lab` (the listing, from a sandbox door's address; no address is kept), `machines` (each one used:
-`requested`, `machine`, `kind`, `session`, `held`, `held_at`, `released_at`), `started_at`, `ended_at`, `status`
+`requested`, `machine`, `kind`, `session`, `held`, `held_at`, `released_at`), `official_sdk` (each device worked with
+a manufacturer's own package, [`m.moku()`](#a-moku-with-the-official-sdk): `package`, `version`, `machine`, `device`;
+the lab records those calls), `started_at`, `ended_at`, `status`
 (`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` (a live run's),
 `calls`, `outputs` (the files the run itself left, the raw ones counted in `raw_files`; an analysis adds its own
 later) and `versions`.
@@ -147,6 +150,59 @@ withdrawn. A signal that comes while a session starts or ends waits until that c
 script stops is ignored. The handlers are installed when the block starts and the script's own are back at its
 end (a signal the script ignores stays ignored). Only the main thread installs them.
 
+## A Moku with the official SDK
+
+A lab's Moku can be worked with the manufacturer's own Python package, `moku`, as at the device: code written
+against a Moku runs unchanged but for its address, and every call goes through the lab. `m.moku(device)` gives
+the keyword arguments for any of the package's instruments, `MultiInstrument` and `Moku`, on the Moku `device` of
+the machine in the block:
+
+```python
+import sys
+from moku.instruments import SpectrumAnalyzer
+from qupai_lab import Lab
+
+lab = Lab.from_env()
+with lab.machine(sys.argv[1]) as m:
+    with SpectrumAnalyzer(**m.moku("moku")) as sa:   # hands the Moku back at the block's end
+        sa.set_span(frequency1=0, frequency2=10e6)
+        spectrum = sa.get_data()
+    lab.save("data/spectrum.json", spectrum)
+```
+
+`MultiInstrument(**m.moku("moku"), platform_id=4)` and its `set_instrument` work the same way. `m.moku()` calls
+nothing; it answers three arguments:
+
+| Argument | Value |
+| --- | --- |
+| `ip` | The lab's address without `http://`, then `/v1/moku/<device>`. The package builds `http://{ip}/api/<group>/<operation>`, so its calls reach `<QUPAI_LAB_URL>/v1/moku/<device>/api/…`, where InstruCore answers the Moku's own HTTP API behind its checks |
+| `session_headers` | The headers of this `Lab`'s own calls: `Authorization: Bearer <key>`, `X-InstruCore-Script` (when the script has one) and `User-Agent`. The package makes them its HTTP session's headers and adds its `Moku-Client-Key`, so each call gives a new dict |
+| `manage_bitstreams` | `False`: the package uploads no FPGA bitstreams, since InstruCore uploads what the Moku lacks at the lab PC |
+
+- **The lab checks every call** as it checks this SDK's. The key tells the lab whose calls they are, so they belong
+  to whatever this `Lab` holds: the block's copy, or a run's live machine. Reads pass; writes need the hold, and on a
+  live machine the lab's limits and the member's approval. The package raises its own exceptions
+  (`moku.exceptions.MokuException` and its kinds), never `LabError`, and it does not wait and ask again on a `429`
+  as this SDK does.
+- **Ownership.** Each instrument's constructor claims the Moku (`claim_ownership`); the lab grants it only while
+  this key holds the machine, and `force_connect` takes the Moku from no one. Hand it back with
+  `relinquish_ownership()`, or with a `with` block as above.
+- **The lab keeps the record.** InstruCore records every call of the package. The `record` file, the manifest's
+  `calls` and `lab.changes()` count and list this SDK's own calls only; the manifest's `official_sdk` (and
+  `changes.json`, when there is any) names each device worked this way: `package`, `version`, `machine`, `device`.
+- **http only.** The package builds `http://` URLs itself, so the lab must be at an http address, as a QuPai
+  sandbox's door is; an https address raises `LabError` `HTTP_ONLY`. A device id is letters, digits, `_` and `-`
+  (`INVALID_DEVICE` otherwise).
+- **Not through the lab:** streaming (`start_streaming`, `get_stream_data`, `stream_to_file`) runs the
+  manufacturer's `mokucli` against the device itself. `import moku` warns that it cannot find `mokucli`; nothing
+  above needs it.
+- The package's other arguments keep their defaults and may be given beside: `SpectrumAnalyzer(**m.moku("moku"),
+  read_timeout=60)`. The lab needs an InstruCore that offers `/v1/moku/<device>`; an older one answers `404`, which
+  the package reports as "Method not found".
+
+`moku` is not a dependency of `qupai-lab`, which only builds its arguments: a QuPai sandbox has it, and
+`pip install "qupai-lab[moku]"` installs the version this SDK is tested with (4.3.0.1, MIT).
+
 ## The record and `changes.json`
 
 `record` (a path) gets one JSON line per call, appended: `time`, `method`, `path`, `args`, `ok`, `status`,
@@ -170,7 +226,9 @@ the rest fixed. `channel` never moves: each channel is its own change.
 A box reads `"ranges": {"x": [min, max], "y": [min, max]}` in place of `quantity`, `min` and `max`.
 
 With a run folder the answer starts with `run`, the run's id; a rehearsal also writes it to
-`<experiment>/changes.json`, where a live run's card reads it.
+`<experiment>/changes.json`, where a live run's card reads it. A script that worked a Moku with the official package
+gets `official_sdk` after `machines` (the devices, as in the manifest): those writes are in the lab's record, not
+among the changes.
 
 Every request sends `Authorization: Bearer <key>` and `X-InstruCore-Script: <script>@<commit>`: the running
 script's path in its git repository and the short commit, so the lab's record shows the code behind each call.
@@ -243,16 +301,19 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |
+| `INVALID_DEVICE`, `HTTP_ONLY` | `m.moku()`'s own: not a plain device id; the lab's address is not plain http, which the official `moku` package needs |
 
 ## Tests
 
 ```
 cd sdk/python
-python3 -m venv .venv && .venv/bin/pip install -e . pytest
+python3 -m venv .venv && .venv/bin/pip install -e ".[moku]" pytest
 .venv/bin/pytest -q
 ```
 
-They run against a fake InstruCore in a thread; `qupai-lab run`'s tests make git repositories under the test's
+They run against a fake InstruCore in a thread; `tests/test_moku_official.py` drives the official `moku` package
+through `m.moku()` against the fake's stand-in for InstruCore's Moku endpoint, and is skipped when the package is not
+installed (`pip install -e . pytest` without the extra); `qupai-lab run`'s tests make git repositories under the test's
 temporary folder and checkouts in `/tmp/qupai-run-<run>`, and send signals to scripts in subprocesses. `tests/test_integration.py` also runs against a real InstruCore
 with a simulated pool when `QUPAI_LAB_IT_URL` and `QUPAI_LAB_IT_KEY` (a read-write key) are set;
 `QUPAI_LAB_IT_POOL` picks the pool.

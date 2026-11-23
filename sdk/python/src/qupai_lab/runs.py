@@ -11,7 +11,8 @@ The folder is made at the script's first call or output, with ``manifest.json``:
 script and its git blob, its arguments, the commit and whether the experiment differed from it, each file of
 ``inputs/`` with its blob), where (each machine held, its kind and session), when, how it ended (``status``:
 ``running``, ``ended``, ``failed``, ``stopped``; a live run's ``exit_code``), its calls, the files it left, and the
-versions. ``simulated`` is true when every machine it held was a simulated copy.
+versions; ``official_sdk``, each device it worked with a manufacturer's own SDK (``Machine.moku``), whose calls the
+lab records. ``simulated`` is true when every machine it held was a simulated copy.
 
 ``experiments/INDEX.md`` lists every experiment and its runs from their manifests (``write_index``); a rehearsal
 writes it as it ends, ``qupai-lab run`` after a live run, ``qupai-lab index`` on demand.
@@ -204,6 +205,7 @@ class RunFolder:
             "inputs": inputs_of(self.experiment),
             "lab": self.lab,
             "machines": [],
+            "official_sdk": [],
             "started_at": now_iso(),
             "ended_at": None,
             "status": "running",
@@ -230,6 +232,18 @@ class RunFolder:
         self.manifest["simulated"] = all(k != "live" for k in kinds) if kinds else None
         self.save()
         return len(machines) - 1
+
+    def official(self, entry: dict[str, Any]) -> None:
+        """A device the script worked with a manufacturer's own SDK (``Machine.moku``): ``package``, ``version``,
+        ``machine``, ``device``. The lab records that SDK's calls; ``calls`` counts only the Lab SDK's."""
+        self.ensure()
+        assert self.manifest is not None
+        used = self.manifest.setdefault("official_sdk", [])
+        if entry not in used:
+            used.append(dict(entry))
+        if entry.get("version"):
+            self.manifest["versions"][entry["package"]] = entry["version"]
+        self.save()
 
     def released(self, index: int) -> None:
         if self.manifest is not None and 0 <= index < len(self.manifest["machines"]):
