@@ -6,16 +6,20 @@ description: Operate a QuPai lab's instruments through this plugin's lab tools (
 # Operating a QuPai lab
 
 This plugin's `lab` server is the user's QuPai lab: QuPai's gateway in front of the lab PC's InstruCore, the program
-that drives the lab's instruments. Every call is checked there: the user's role on the lab, the lab's limits, and who
-holds each machine.
+that drives the lab's instruments. Every call is checked there: the user's role on the bench, the lab's limits, and
+who holds each machine.
 
-What the user's role allows:
+One lab PC may serve several benches of the lab. Each bench is a real machine of its own, with its own instruments,
+holder and queue; no instrument is shared between benches. `machines` lists each by its id (a lab with only one
+bench calls it `bench`; never assume that name). The user holds a role on each bench, and a bench they hold no role
+on is not listed and answers `NOT_FOUND`. What the role on a bench allows there:
 
-| Role | Simulated copies | Real machines |
+| Role | Simulated copies | The real machine |
 | --- | --- | --- |
 | View | Everything | Read, watch live |
-| Operate | Everything | Also hold a machine in a session and write to it |
-| Admin | Everything | Also end someone else's session |
+| Operate | Everything | Also hold it in a session and write to it |
+| Configure | Everything | Also end someone else's session there; building the bench and its limits are on the lab's page, not tools |
+| Admin (the lab's) | Everything | Configure on every bench |
 
 The lab's admin decides how far an agent outside QuPai goes: at view, you hold the view role here whatever the
 user's own role is.
@@ -23,7 +27,8 @@ user's own role is.
 ## Rules
 
 1. **Look first.** Call `machines`, then `describe` the machine or instrument before acting: its operations, units
-   and limits.
+   and limits. When the lab has several benches, work on the one the user names, by its id; if they did not say
+   which, ask. Never carry a value, a session or a conclusion from one bench to another.
 2. **Rehearse on a simulated copy.** `start_simulated_session` with the machine's pool gives a fresh copy with the same
    instruments, operations and limits and no hardware. End it with `end_session` when done.
 3. **Ask before a real write.** Before anything that changes a real machine, tell the user exactly what you will
@@ -36,8 +41,8 @@ user's own role is.
    in your session like any other write, after telling the user exactly what you will write. Without a session, name
    the instrument and leave it to the user.
 6. **Say where each number came from:** the real machine, or a simulated copy.
-7. **The user can watch.** `/qupai-lab:watch` opens the lab's live page in QuPai, where every call shows in the
-   activity strip, yours marked as an agent's.
+7. **The user can watch.** `/qupai-lab:watch` opens the lab's live page in QuPai (`/qupai-lab:watch <bench>` one
+   bench), where every call shows in the activity strip, yours marked as an agent's.
 
 ## When a call is refused
 
@@ -46,7 +51,8 @@ user's own role is.
 | `SESSION_REQUIRED`, `BENCH_NOT_HELD` | Start a session on that machine first |
 | `BENCH_HELD`, `MACHINE_IN_SESSION` | Someone else holds it; reads still work. Offer to join the queue |
 | `QUEUE_WAITING`, `SESSION_PENDING` | You are in the queue; it says where |
-| `FORBIDDEN` with `required` | The user's role, or the lab's setting for outside agents, does not allow it. Tell the user |
+| `FORBIDDEN` with `required` | The user's role on that bench, or the lab's setting for outside agents, does not allow it. Tell the user |
+| `NOT_FOUND` for a machine | No such bench, or one the user holds no role on. Check `machines` |
 | `LIMIT_EXCEEDED` | Rule 4 |
 
 If the lab's tools are missing or say unauthorized, the user signs in once: `/mcp`, the server

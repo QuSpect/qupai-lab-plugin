@@ -61,10 +61,16 @@ lab.changes("changes.json")                    # the writes above, for a live ru
 lists them. A script addresses instruments by role, so the same script works on any copy of a pool and on the
 machine the pool simulates, when their roles have the same names.
 
+**Name the bench.** One lab PC may serve several benches of the lab, each a live machine of its own (with its own
+instruments, holder and queue) named by its public id, such as `rydberg-a`; a lab with only one bench calls it
+`bench`. `lab.machine()` always takes the id: there is no default machine, so take it from the command line, as
+above, and never write `bench` into a script that may meet another lab. `lab.machines()` lists only the benches
+the key's member holds a role on; another bench answers `NOT_FOUND`.
+
 | Call | What it does |
 | --- | --- |
-| `lab.machines()` | Each live machine and simulated copy: `id` (public id), `internal_id`, `name`, `kind`, `state`, `status`, `pool`, `roles` (role → instrument id) |
-| `lab.machine(id, *, purpose="", wait_s=None)` | A machine for a `with` block (below) |
+| `lab.machines()` | Each live machine (a bench) and simulated copy the member may see: `id` (public id), `internal_id`, `name`, `kind`, `state`, `status`, `pool`, `roles` (role → instrument id) |
+| `lab.machine(id, *, purpose="", wait_s=None)` | A machine for a `with` block (below), by id or public id; there is no default |
 | `m.role(name)` | The instrument in that role |
 | `inst.read(op, **args)` | A read op; answers its result. Anyone may read |
 | `inst.write(op, **args)` | A write op in the machine's session; the lab checks its limits first |
@@ -234,6 +240,7 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `RUN_REQUIRED` | A script asked to hold a live machine: only a run the member approved holds one |
 | `SESSION_REQUIRED`, `MACHINE_IN_SESSION` | The write needs your session on that machine, or someone else holds it |
 | `INVALID_KEY`, `FORBIDDEN`, `RATE`, `UNAVAILABLE` (the gateway's) | The key, your role on the lab, too many calls, the lab not reachable through QuPai |
+| `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |
 
