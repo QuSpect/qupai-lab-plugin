@@ -129,3 +129,36 @@ def test_a_refusal_in_the_mokus_own_envelope_reaches_the_script(door: FakeInstru
             instruments.Oscilloscope(**m.moku(DEVICE))
     assert "is not held with this key" in str(e.value)
     assert door.sessions == {}  # the block still released the copy
+
+
+def test_a_rehearsals_changes_list_the_writes_the_lab_listed(door: FakeInstruCore, tmp_path: Path) -> None:
+    """InstruCore 0.26.2 lists each write it made in its answer (instrucore.writes); the Lab SDK keeps them for
+    changes.json under the instrument's role, so a live run's card can approve the package's writes."""
+    door.moku_writes_role = "tbs1104_usb"
+    lab = Lab(door.url, "qpk_test", script_ref="experiments/x/run.py@abc1234")
+    with lab.machine("signal-bench-sim") as m:
+        mim = instruments.MultiInstrument(**m.moku("moku_pro"), platform_id=4)
+        sa = mim.set_instrument(1, instruments.SpectrumAnalyzer)
+        sa.set_span(frequency1=0, frequency2=10e6)
+        sa.get_data()
+        mim.relinquish_ownership()
+    out = lab.changes(tmp_path / "changes.json")
+    assert [(c["role"], c["op"], c["calls"], c["fixed"]) for c in out["changes"]] == [
+        ("tbs1104_usb", "moku.moku.platform", 1, {"platform_id": 4}),
+        ("tbs1104_usb", "moku.slot1.spectrumanalyzer.deploy", 1, {}),
+        ("tbs1104_usb", "moku.slot1.spectrumanalyzer.set_span", 1, {"strict": True, "frequency1": 0, "frequency2": 10e6}),
+    ]
+    assert out["official_sdk"] == [{"package": "moku", "version": "4.3.0.1", "machine": COPY, "device": "moku_pro"}]
+
+
+def test_a_lab_that_lists_no_writes_is_noted(door: FakeInstruCore, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Before 0.26.2 InstruCore's answers list nothing: the writes are not in changes.json, and it says so."""
+    lab = Lab(door.url, "qpk_test", script_ref="")
+    with lab.machine("signal-bench-sim") as m:
+        mim = instruments.MultiInstrument(**m.moku("moku_pro"), platform_id=4)
+        mim.set_instrument(1, instruments.SpectrumAnalyzer).set_span(frequency1=0, frequency2=10e6)
+        mim.relinquish_ownership()
+    out = lab.changes(tmp_path / "changes.json")
+    assert out["changes"] == []
+    assert out["official_sdk"][0]["writes_listed"] is False
+    assert capsys.readouterr().err.count("lists no writes") == 1

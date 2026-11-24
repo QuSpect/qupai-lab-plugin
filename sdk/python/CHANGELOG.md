@@ -1,5 +1,17 @@
 # Changelog: the Lab SDK (`qupai-lab`)
 
+## 0.4.1
+
+- A rehearsal's `changes.json` lists the writes code made with the official `moku` package (`m.moku()`), so a live
+  run's card can approve them. Before, it left them out and every such write of a live run was refused
+  `APPROVAL_REQUIRED`. `m.moku()` gives the package a response hook (`session_hooks`), which reads the writes the
+  lab lists in each answer (`instrucore.writes`: instrument, op and arguments, exactly as the lab matches a run's
+  permission; InstruCore 0.26.2 on) and keeps them under the instrument's role on the machine. A lab whose answers
+  list none is said once on stderr, and `official_sdk` gets `"writes_listed": false`.
+- `qupai-lab run` keeps the script's stdout and stderr as the run's `output.log` (the first MiB), still passing them
+  on as before, and a run that did not end well gets the last lines of its stderr in the manifest (`error`).
+  Before, a failed run's folder did not say why it failed.
+
 ## 0.4.0
 
 - `m.moku(device)`: the keyword arguments for the official `moku` package on a Moku of the machine in the block,

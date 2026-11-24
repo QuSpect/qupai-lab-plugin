@@ -64,6 +64,9 @@ class FakeInstruCore:
         self.run_keys: set[str] = set()  # keys of live runs on the bench
         self.before: dict[tuple[str, str], Callable[[], None]] = {}  # called as that request arrives
         self.moku_refusal: str | None = None  # set: every Moku call is refused with it, in the Moku's envelope
+        # set to a role: the Moku's answers list their writes (instrucore.writes, InstruCore 0.26.2) as made on the
+        # held machine's instrument in that role; None answers as InstruCore before 0.26.2 (no list)
+        self.moku_writes_role: str | None = None
         self.lock = threading.Lock()
         self._n = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -176,14 +179,28 @@ class FakeInstruCore:
         if len(rest) >= 5 and rest[0] == "moku" and rest[3] == "api":
             if _internal(rest[1]) not in ("bench", *COPIES):
                 return 404, _err("NOT_FOUND", f"机器 {rest[1]} 不存在", resource="machine")
-            return self._moku(method, "/".join(rest[4:]), body)
+            return self._moku(method, "/".join(rest[4:]), body, _internal(rest[1]))
         return 404, _err("NOT_FOUND", f"no route {method} {path}")
 
-    def _moku(self, method: str, op: str, body: Any) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
+    def _moku(self, method: str, op: str, body: Any, machine: str = "bench") -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
         """A Moku's own answers for the calls the tests make; an operation it does not know is a 404, as on a
         Moku."""
+        writes: list[dict[str, Any]] = []
+        if self.moku_writes_role is not None:
+            instrument = _instrument_ids(machine)[self.moku_writes_role]
+            parts = op.split("/")
+            if method == "GET" and re.fullmatch(r"moku/platform/\d+", op):
+                writes = [{"instrument": instrument, "op": "moku.moku.platform", "args": {"platform_id": int(parts[2])}}]
+            elif method == "GET" and re.fullmatch(r"slot\d+/\w+", op):
+                writes = [{"instrument": instrument, "op": f"moku.{parts[0]}.{parts[1]}.deploy", "args": {}}]
+            elif method == "POST" and re.fullmatch(r"slot\d+/\w+/\w+", op) and not parts[2].startswith("get_"):
+                writes = [{"instrument": instrument, "op": "moku." + ".".join(parts), "args": body or {}}]
+
         def ok(data: Any) -> tuple[int, Any]:
-            return 200, {"success": True, "data": data, "messages": [], "code": None}
+            answer = {"success": True, "data": data, "messages": [], "code": None}
+            if self.moku_writes_role is not None:
+                answer["instrucore"] = {"writes": writes}
+            return 200, answer
 
         if self.moku_refusal is not None:
             return 200, {"success": False, "data": None, "messages": [self.moku_refusal], "code": "SESSION_REQUIRED"}

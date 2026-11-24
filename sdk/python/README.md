@@ -108,7 +108,7 @@ experiments/
         │   ├── manifest.json
         │   ├── calls.jsonl  changes.json
         │   └── data/response.csv  data/raw/ (not committed)  figures/
-        └── 01a20106-20c6-…/          a live run, its job's id: the same files
+        └── 01a20106-20c6-…/          a live run, its job's id: the same files, and output.log
 ```
 
 `manifest.json` says what ran and how it ended: `run`, `kind` (`rehearsal` or `live`), `simulated` (every machine
@@ -118,7 +118,8 @@ blob id), `lab` (the listing, from a sandbox door's address; no address is kept)
 `requested`, `machine`, `kind`, `session`, `held`, `held_at`, `released_at`), `official_sdk` (each device worked with
 a manufacturer's own package, [`m.moku()`](#a-moku-with-the-official-sdk): `package`, `version`, `machine`, `device`;
 the lab records those calls), `started_at`, `ended_at`, `status`
-(`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` (a live run's),
+(`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` and `error` (a live
+run's; `error` is the end of its stderr when it did not end well),
 `calls`, `outputs` (the files the run itself left, the raw ones counted in `raw_files`; an analysis adds its own
 later) and `versions`.
 
@@ -178,6 +179,7 @@ nothing; it answers three arguments:
 | `ip` | The lab's address without `http://`, then `/v1/moku/<machine>/<device>`. `<machine>` is the machine in the block by its public id, as `lab.machines()` lists it: the live machine, or the simulated copy the block holds, so the same script reaches the copy in a rehearsal and the live Moku in a run. The package builds `http://{ip}/api/<group>/<operation>`, so its calls reach `<QUPAI_LAB_URL>/v1/moku/<machine>/<device>/api/…`, where InstruCore answers that Moku's own HTTP API behind its checks |
 | `session_headers` | The headers of this `Lab`'s own calls: `Authorization: Bearer <key>`, `X-InstruCore-Script` (when the script has one) and `User-Agent`. The package makes them its HTTP session's headers and adds its `Moku-Client-Key`, so each call gives a new dict |
 | `manage_bitstreams` | `False`: the package uploads no FPGA bitstreams, since InstruCore uploads what the Moku lacks at the lab PC |
+| `session_hooks` | A response hook that reads the writes the lab lists in each answer (`instrucore.writes`, InstruCore 0.26.2 on), for `changes.json` ([below](#the-record-and-changesjson)) |
 
 - **The lab checks every call** as it checks this SDK's. The key tells the lab whose calls they are, so they belong
   to whatever this `Lab` holds: the block's copy, or a run's live machine. Reads pass; writes need the hold, and on a
@@ -187,9 +189,13 @@ nothing; it answers three arguments:
 - **Ownership.** Each instrument's constructor claims the Moku (`claim_ownership`); the lab grants it only while
   this key holds the machine, and `force_connect` takes the Moku from no one. Hand it back with
   `relinquish_ownership()`, or with a `with` block as above.
-- **The lab keeps the record.** InstruCore records every call of the package. The `record` file, the manifest's
-  `calls` and `lab.changes()` count and list this SDK's own calls only; the manifest's `official_sdk` (and
-  `changes.json`, when there is any) names each device worked this way: `package`, `version`, `machine`, `device`.
+- **The lab keeps the record.** InstruCore records every call of the package. The `record` file and the manifest's
+  `calls` count this SDK's own calls only; the manifest's `official_sdk` (and `changes.json`, when there is any)
+  names each device worked this way: `package`, `version`, `machine`, `device`.
+- **Its writes are changes.** Each answer of the lab lists the writes it made (`instrucore.writes`), and
+  `lab.changes()` lists them with this SDK's own, under the instrument's role, so a rehearsal's `changes.json` lets
+  a live run make them. A lab whose InstruCore is older than 0.26.2 lists none: that is said once on stderr,
+  `official_sdk` gets `"writes_listed": false`, and a live run of such a script is refused at its first write.
 - **http only.** The package builds `http://` URLs itself, so the lab must be at an http address, as a QuPai
   sandbox's door is; an https address raises `LabError` `HTTP_ONLY`. A machine's and a device's id are letters,
   digits, `_` and `-` (`INVALID_MACHINE`, `INVALID_DEVICE` otherwise).
@@ -227,8 +233,8 @@ A box reads `"ranges": {"x": [min, max], "y": [min, max]}` in place of `quantity
 
 With a run folder the answer starts with `run`, the run's id; a rehearsal also writes it to
 `<experiment>/changes.json`, where a live run's card reads it. A script that worked a Moku with the official package
-gets `official_sdk` after `machines` (the devices, as in the manifest): those writes are in the lab's record, not
-among the changes.
+gets `official_sdk` after `machines` (the devices, as in the manifest), and the writes the lab listed for those calls
+are among the changes ([above](#a-moku-with-the-official-sdk)).
 
 Every request sends `Authorization: Bearer <key>` and `X-InstruCore-Script: <script>@<commit>`: the running
 script's path in its git repository and the short commit, so the lab's record shows the code behind each call.
@@ -251,11 +257,13 @@ qupai-lab run --key-file .qupai/runs/<run>/key.env --commit <sha> experiments/20
    rehearsal's, from before run folders) are removed from that checkout, so what the run keeps is its own.
 3. It runs `python run.py <machine>` in `<checkout>/<experiment>` with the Python it runs in, with the four
    settings in place of any other `QUPAI_*` variable and `PYTHONUNBUFFERED=1`. The script's output is the
-   command's own, as it is printed. The script's `Lab.from_env()` gets the run's key and its run folder
-   (`runs/<run>/`), and `lab.machine(<machine>)` holds the live machine (above).
+   command's own, as it is printed, and is also kept as the run's `output.log` (stdout and stderr, the first
+   MiB). The script's `Lab.from_env()` gets the run's key and its run folder (`runs/<run>/`), and
+   `lab.machine(<machine>)` holds the live machine (above).
 4. When the script ends it copies the run folder, and any `data/`, `figures/`, `calls.jsonl` and `changes.json`
    the script wrote beside `run.py` itself, to `<experiment>/runs/<run>/` in the repository. The manifest gets
-   the approved commit, the exit code and the status from it (a short one is written when the script left none),
+   the approved commit, the exit code and the status from it, and for a script that did not end well the last
+   lines of its stderr as `error` (a short manifest is written when the script left none),
    `experiments/INDEX.md` is written again, and the checkout is removed, also when the script failed.
 5. It exits with the script's exit code (128 + the signal's number when a signal ended the script).
 

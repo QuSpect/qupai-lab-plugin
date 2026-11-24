@@ -80,6 +80,9 @@ def test_the_arguments_for_a_held_copy(lab: Lab, fake: FakeInstruCore) -> None:
         assert len(fake.seen) == before  # builds arguments only: nothing is called
     host = fake.url.removeprefix("http://")
     headers = args.pop("session_headers")
+    # One response hook: it reads the writes the lab lists in each answer (instrucore.writes) for changes.json.
+    hooks = args.pop("session_hooks")
+    assert list(hooks) == ["response"] and len(hooks["response"]) == 1 and callable(hooks["response"][0])
     # The copy the pool gave, by its public id as lab.machines() lists it.
     assert args == {"ip": f"{host}/v1/moku/signal-bench-sim-1/moku_go", "manage_bitstreams": False}
     # The key and the script header this Lab sends on its own calls; no Accept: the package also fetches files.
