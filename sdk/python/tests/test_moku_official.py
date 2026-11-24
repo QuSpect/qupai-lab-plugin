@@ -4,6 +4,7 @@ InstruCore's Moku endpoint, mounted under a path as a QuPai sandbox's door mount
 
 from __future__ import annotations
 
+import importlib.metadata
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -31,8 +32,18 @@ def door() -> Iterator[FakeInstruCore]:
     server.stop()
 
 
+MOKU = importlib.metadata.version("moku") if instruments else ""
+V44 = tuple(int(x) for x in MOKU.split(".")[:2]) >= (4, 4)
+# moku 4.4 asks the device before choosing a platform and before each deploy; 4.3 does not. The rest is the same.
+QUESTIONS = ("moku/platform_supported", "moku/instrument_supported")
+
+
 def moku_calls(fake: FakeInstruCore) -> list[Seen]:
-    return [s for s in fake.seen if s.path.startswith("/v1/moku/")]
+    """The package's calls through the lab, without 4.4's two questions (checked to be there exactly with 4.4)."""
+    seen = [s for s in fake.seen if s.path.startswith("/v1/moku/")]
+    asked = [s for s in seen if s.path.endswith(QUESTIONS)]
+    assert bool(asked) == V44 or not any(s.path.endswith(("/deploy", "/platform/4")) or "/slot" in s.path for s in seen)
+    return [s for s in seen if not s.path.endswith(QUESTIONS)]
 
 
 def test_an_oscilloscope_through_the_lab(door: FakeInstruCore, tmp_path: Path) -> None:
@@ -60,8 +71,10 @@ def test_an_oscilloscope_through_the_lab(door: FakeInstruCore, tmp_path: Path) -
     assert calls[0].headers.get("Moku-Client-Key") is None
     assert all(s.headers["Moku-Client-Key"] == MOKU_CLIENT_KEY for s in calls[1:])
     # Nothing forces: the claim asks with the package's defaults.
-    assert calls[0].body == {"force_connect": False, "force_deploy": False, "ignore_busy": False,
-                             "persist_state": False}
+    claim = dict(calls[0].body)
+    # moku 4.4 also names the client (the computer's name by default); InstruCore 0.27.1 takes it
+    assert isinstance(claim.pop("client_name", None), str) == V44
+    assert claim == {"force_connect": False, "force_deploy": False, "ignore_busy": False, "persist_state": False}
     # No bitstream is uploaded from the sandbox (manage_bitstreams=False).
     assert not any("bitstream" in s.path for s in door.seen)
     # The Moku's calls fall inside the block's hold.
@@ -148,7 +161,7 @@ def test_a_rehearsals_changes_list_the_writes_the_lab_listed(door: FakeInstruCor
         ("tbs1104_usb", "moku.slot1.spectrumanalyzer.deploy", 1, {}),
         ("tbs1104_usb", "moku.slot1.spectrumanalyzer.set_span", 1, {"strict": True, "frequency1": 0, "frequency2": 10e6}),
     ]
-    assert out["official_sdk"] == [{"package": "moku", "version": "4.3.0.1", "machine": COPY, "device": "moku_pro"}]
+    assert out["official_sdk"] == [{"package": "moku", "version": MOKU, "machine": COPY, "device": "moku_pro"}]
 
 
 def test_a_lab_that_lists_no_writes_is_noted(door: FakeInstruCore, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

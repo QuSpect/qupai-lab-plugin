@@ -1,5 +1,19 @@
 # Changelog: the Lab SDK (`qupai-lab`)
 
+## 0.4.2
+
+- `m.moku(device)` works with the official `moku` package 4.4.0.0 as well as 4.3.0.1. The package now talks to a
+  local stand-in for the Moku (`qupai_lab.moku_forward`, one per device until the block ends), which passes every
+  call on to `<lab>/v1/moku/<machine>/<device>/api/…` with this Lab's key, script header and user agent and keeps the
+  writes the lab lists. 4.4's fast transport kept only the host and port of the address it was given and sent no
+  headers, so its calls missed the lab (`MissingApiServer` on the Magnetic lab's MokuOS 4.4 Pro, 2026-11-24).
+  `m.moku()` answers `ip` (`127.0.0.1:<port>`), `manage_bitstreams=False`, `session_trust_env=False` and
+  `session_proxies={}`; `session_headers` and `session_hooks` are gone. It sets `MOKU_API_DISABLE_BITSTREAM_MANAGEMENT=1`,
+  which 4.4 reads in place of `manage_bitstreams`. Needs InstruCore 0.27.1 for 4.4's calls (its `client_name` and
+  its two questions before a deploy).
+- A lab at an https address works too (the stand-in makes the call); `HTTP_ONLY` is gone, an address that is not
+  http(s) raises `INVALID_URL`. `moku_address` is now `moku_target` (the full URL of the lab's endpoint).
+
 ## 0.4.1
 
 - A rehearsal's `changes.json` lists the writes code made with the official `moku` package (`m.moku()`), so a live

@@ -11,6 +11,8 @@ QuPai sandbox's door does (``/lab/<listing>``)."""
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import json
 import re
 import threading
@@ -24,7 +26,20 @@ POOL = "signal_bench_sim"
 POOL_PUBLIC = "signal-bench-sim"
 COPIES = ("signal_bench_sim_1", "signal_bench_sim_2")
 MOKU_CLIENT_KEY = "fake-moku-client-key"
-MOKU_DESCRIBE = {"hardware": "Moku:Go", "mokuOS": "4.3.0", "proxy_version": 2, "bitstreams": {}}
+def _moku_package() -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in importlib.metadata.version("moku").split(".")[:2])
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return (4, 3)
+
+
+# The Moku's describe as the installed package expects it: moku 4.3 speaks proxy 2 (MokuOS 4.0.1 to 4.3), 4.4 proxy 3
+# (MokuOS 4.4 on), which also names its instruments' build.
+MOKU_DESCRIBE = (
+    {"hardware": "Moku:Go", "mokuOS": "4.4.0", "proxy_version": 3, "bitstreams": {}, "instruments_build": 21738}
+    if _moku_package() >= (4, 4)
+    else {"hardware": "Moku:Go", "mokuOS": "4.3.0", "proxy_version": 2, "bitstreams": {}}
+)
 
 
 def _instrument_ids(machine: str) -> dict[str, str]:
@@ -210,12 +225,15 @@ class FakeInstruCore:
             return ok("Ownership relinquished")
         if (method, op) == ("GET", "moku/describe"):
             return ok(MOKU_DESCRIBE)
+        if (method, op) in (("POST", "moku/platform_supported"), ("POST", "moku/instrument_supported")):
+            return ok(None)  # moku 4.4 asks before a deploy; a device that supports it answers null
         if method == "GET" and re.fullmatch(r"moku/platform/\d+", op):
-            return ok(f"Platform {op.rsplit('/', 1)[-1]} deployed")
+            # MokuOS 4.4 answers null (moku 4.4 insists); 4.3 a sentence
+            return ok(None if _moku_package() >= (4, 4) else f"Platform {op.rsplit('/', 1)[-1]} deployed")
         if (method, op) == ("GET", "mim/get_instruments"):
             return ok(["", "", "", ""])
         if method == "GET" and re.fullmatch(r"slot\d+/\w+", op):
-            return ok(f"{op.split('/')[1]} deployed")
+            return ok(None if _moku_package() >= (4, 4) else f"{op.split('/')[1]} deployed")
         if method == "POST" and op.endswith("/get_data"):
             return ok({"ch1": [0.0, 0.5, 1.0], "ch2": [1.0, 0.5, 0.0], "time": [0.0, 1e-6, 2e-6]})
         if method == "POST" and re.fullmatch(r"slot\d+/\w+/\w+", op):
