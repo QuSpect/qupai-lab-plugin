@@ -13,23 +13,28 @@ permissions:
 
 jobs:
   test:
-    name: test (Python ${{ matrix.python }})
+    name: test (Python ${{ matrix.python }}, moku ${{ matrix.moku }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: true
       matrix:
         python: ["3.10", "3.13"]
+        # m.moku() with both generations of the official package (MokuOS 4.3 and earlier, 4.4 on)
+        moku: ["4.3.0.1", "4.4.0.0"]
+        exclude:
+          - python: "3.10"  # moku 4.4.0.0 needs Python 3.11
+            moku: "4.4.0.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      # With the moku extra, so the test that drives the official moku package through m.moku() runs too.
+      # With the official moku package (each generation), so the tests that drive it through m.moku() run too.
       - name: Test
         working-directory: sdk/python
         run: |
-          python -m pip install -e ".[moku]" pytest
+          python -m pip install -e . pytest "moku==${{ matrix.moku }}"
           python -m pytest -q
 
   build:

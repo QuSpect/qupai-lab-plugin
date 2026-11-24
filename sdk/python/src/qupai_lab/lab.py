@@ -23,6 +23,7 @@ from urllib.parse import quote, urlsplit
 
 from qupai_lab import __version__, config, metric, stop
 from qupai_lab import changes as _changes
+from qupai_lab.moku_forward import Forwarder
 from qupai_lab import runs as _runs
 from qupai_lab.errors import LabError, from_response
 from qupai_lab.record import Recorder, dumps, ensure_parent, now_iso
@@ -58,29 +59,20 @@ def _plain_id(value: Any, kind: str, what: str) -> None:
         )
 
 
-def moku_address(url: str, machine_id: Any, device_id: Any) -> str:
-    """The ``ip`` the official moku package gets for the Moku ``device_id`` of the machine ``machine_id`` (the live
-    machine, or the simulated copy held) of the lab at ``url``: the address without ``http://``, and
-    ``/v1/moku/<machine_id>/<device_id>``. The package builds ``http://{ip}/api/<group>/<operation>``, so its calls
-    reach ``<url>/v1/moku/<machine_id>/<device_id>/api/…``, InstruCore's copy of the Moku's own HTTP API."""
+def moku_target(url: str, machine_id: Any, device_id: Any) -> str:
+    """Where the lab answers the Moku ``device_id`` of the machine ``machine_id`` (the live machine, or the simulated
+    copy held) in the lab at ``url``: ``<url>/v1/moku/<machine_id>/<device_id>``, InstruCore's copy of the Moku's own
+    HTTP API. ``Machine.moku`` points the official package at a local forwarder that passes its calls on to here."""
     _plain_id(machine_id, "machine", "a machine's id")
     _plain_id(device_id, "device", "a Moku's device id")
     parts = urlsplit(url)
-    if parts.scheme == "https":
+    if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
         raise LabError(
-            "HTTP_ONLY",
-            f"the lab's address is https ({url}), and the official moku package speaks http only (it builds "
-            "http://<ip>/api/… itself): reach the lab at an http address, as a QuPai sandbox's door is",
+            "INVALID_URL",
+            f"the lab's address {url!r} is not an http(s)://host[:port][/path] address",
             {"url": url},
         )
-    if parts.scheme != "http" or not parts.netloc or parts.query or parts.fragment:
-        raise LabError(
-            "HTTP_ONLY",
-            f"the lab's address {url!r} is not an http://host[:port][/path] address, which the official moku "
-            "package needs",
-            {"url": url},
-        )
-    return f"{parts.netloc}{parts.path.rstrip('/')}/v1/moku/{machine_id}/{device_id}"
+    return f"{parts.scheme}://{parts.netloc}{parts.path.rstrip('/')}/v1/moku/{machine_id}/{device_id}"
 
 
 def _installed(package: str) -> str | None:
@@ -307,24 +299,22 @@ class Lab:
         if self.run_folder is not None:
             self.run_folder.official(entry)
 
-    def _official_answer(self, m: Machine, device: str) -> Callable[..., None]:
-        """A ``requests`` response hook for a manufacturer's SDK's session (``m.moku``): each answer the lab gives in
-        the Moku's envelope lists the writes it made (``instrucore.writes``: instrument, op and arguments, as the lab
+    def _official_answer(self, m: Machine, device: str) -> Callable[[int, str, bytes], None]:
+        """What the local forwarder of a manufacturer's SDK (``m.moku``) does with each JSON answer of the lab: the
+        Moku's envelope lists the writes the lab made (``instrucore.writes``: instrument, op and arguments, as it
         matches a run's permission), and each is kept for ``changes`` under its role on ``m``. A lab whose answers
         list none (InstruCore before 0.26.2) is said once, and ``changes`` notes it: its writes are not there."""
         roles = {iid: role for role, iid in reversed(list(m.roles.items()))}
         machine = m.public_id or m.target
         said = False
 
-        def hook(response: Any, *args: Any, **kwargs: Any) -> None:
+        def record(status: int, content_type: str, content: bytes) -> None:
             nonlocal said
+            if status != 200 or not content_type.startswith("application/json"):
+                return  # a file the package downloads: never a write
             try:
-                if getattr(response, "status_code", None) != 200:
-                    return
-                if not str(response.headers.get("Content-Type", "")).startswith("application/json"):
-                    return  # a file the package downloads: never a write
-                body = json.loads(response.content)
-            except (ValueError, TypeError, AttributeError):
+                body = json.loads(content)
+            except ValueError:
                 return
             if not isinstance(body, dict) or body.get("success") is not True:
                 return
@@ -345,7 +335,7 @@ class Lab:
                 args = w.get("args") if isinstance(w.get("args"), dict) else {}
                 self._writes.append(_changes.Write(roles.get(instrument, instrument), w["op"], dict(args), machine))
 
-        return hook
+        return record
 
     def _send(self, method: str, path: str, body: dict[str, Any] | None) -> _Answer:
         data = dumps(body).encode("utf-8") if body is not None else None
@@ -554,6 +544,7 @@ class Machine:
         self.roles: dict[str, str] = {}
         self._guarded = False
         self._entry: int | None = None  # this block's line in the run's manifest
+        self._forwarders: dict[str, Forwarder] = {}  # m.moku(): one local stand-in per Moku device
 
     def __repr__(self) -> str:
         return f"Machine({self.public_id or self.target!r}, kind={self.kind!r}, held={self.held})"
@@ -601,6 +592,9 @@ class Machine:
             self.release(reason=self._reason(ended), quiet=kind is not None)
         finally:
             self._unguard()
+            for forwarder in self._forwarders.values():
+                forwarder.close()
+            self._forwarders.clear()
             self.lab.recorder.flush()
 
     def release(self, *, reason: str = "qupai-lab: released", quiet: bool = False) -> dict[str, Any] | None:
@@ -774,27 +768,37 @@ class Machine:
                     sa.set_span(frequency1=0, frequency2=10e6)
                     data = sa.get_data()
 
-        ``ip``: the lab's address without ``http://`` and ``/v1/moku/<machine>/<device_id>``, where InstruCore
-        answers the Moku's own HTTP API behind its checks; ``<machine>`` is this machine's public id, as
-        ``lab.machines()`` lists it: the live machine, or the simulated copy the block holds. ``session_headers``: this Lab's key and script header, a new dict
-        each call. ``manage_bitstreams=False``: InstruCore uploads what the Moku lacks on the lab PC.
-        ``session_hooks``: reads the writes the lab lists in each answer, so a rehearsal's ``changes.json`` has them
-        and a live run's card can approve them (InstruCore 0.26.2 on). Nothing is called here; the package's own
-        calls go to the lab, which records each, and the run's manifest notes the device (``official_sdk``).
-        ``moku`` is not a dependency of qupai-lab (``qupai-lab[moku]`` installs it)."""
+        ``ip``: ``127.0.0.1:<port>``, a local stand-in for the Moku (``qupai_lab.moku_forward``) that passes every call
+        of the package on to ``<lab>/v1/moku/<machine>/<device_id>/api/…``, where InstruCore answers the Moku's own
+        HTTP API behind its checks, with this Lab's key and script header; ``<machine>`` is this machine's public id,
+        as ``lab.machines()`` lists it: the live machine, or the simulated copy the block holds. Every version of the
+        package works through it (4.3's requests session and 4.4's fast transport alike), and it keeps the writes the
+        lab lists in each answer, so a rehearsal's ``changes.json`` has them (InstruCore 0.26.2 on). One stand-in per
+        device, until the block ends. ``manage_bitstreams=False``: InstruCore uploads what the Moku lacks on the lab
+        PC (moku 4.3); from 4.4 the package reads ``MOKU_API_DISABLE_BITSTREAM_MANAGEMENT`` instead, which this sets in the
+        script's environment. ``session_trust_env=False`` and ``session_proxies={}``: the package's ``requests`` session reaches
+        127.0.0.1 directly, whatever proxy the environment names. The run's manifest notes the device
+        (``official_sdk``). ``moku`` is not a dependency of qupai-lab (``qupai-lab[moku]`` installs it)."""
         if self.kind is None:
             raise LabError("NOT_HELD", f"use the machine in a block first: with lab.machine({self.target!r}) as m")
-        ip = moku_address(self.lab.url, self.public_id or self.id, device_id)
+        target = moku_target(self.lab.url, self.public_id or self.id, device_id)
         version = _installed("moku")
-        args = {
-            "ip": ip,
-            "session_headers": self.lab._official_headers("moku", version),
-            # the package sets each session_<name> on its requests session: here its response hooks
-            "session_hooks": {"response": [self.lab._official_answer(self, device_id)]},
-            "manage_bitstreams": False,
-        }
+        forwarder = self._forwarders.get(device_id)
+        if forwarder is None:
+            forwarder = Forwarder(target, self.lab._official_headers("moku", version),
+                                  self.lab._official_answer(self, device_id))
+            self._forwarders[device_id] = forwarder
         self.lab._official("moku", version, self, device_id)
-        return args
+        # moku 4.4 manages bitstreams unless this is set (its manage_bitstreams argument is gone); the lab uploads
+        # what the Moku lacks at the lab PC, and the sandbox has no instrument files to manage.
+        os.environ["MOKU_API_DISABLE_BITSTREAM_MANAGEMENT"] = "1"
+        return {
+            "ip": forwarder.address,
+            "manage_bitstreams": False,
+            # the package sets each session_<name> on its requests session: straight to the local stand-in
+            "session_trust_env": False,
+            "session_proxies": {},
+        }
 
     def reference(self) -> dict[str, Any]:
         """The machine's reference document (``mhs-reference/0``): roles, wiring, session settings, and each

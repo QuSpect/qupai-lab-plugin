@@ -171,15 +171,22 @@ with lab.machine(sys.argv[1]) as m:
     lab.save("data/spectrum.json", spectrum)
 ```
 
-`MultiInstrument(**m.moku("moku"), platform_id=4)` and its `set_instrument` work the same way. `m.moku()` calls
-nothing; it answers three arguments:
+`MultiInstrument(**m.moku("moku"), platform_id=4)` and its `set_instrument` work the same way. The package talks to
+a local stand-in for the Moku that `m.moku()` starts in this process (`qupai_lab.moku_forward`, one per device, until
+the block ends): it passes every call on to `<QUPAI_LAB_URL>/v1/moku/<machine>/<device>/api/…`, where InstruCore
+answers that Moku's own HTTP API behind its checks, with this `Lab`'s key, script header and user agent, and hands
+back the lab's answer. `<machine>` is the machine in the block by its public id, as `lab.machines()` lists it: the
+live machine, or the simulated copy the block holds, so the same script reaches the copy in a rehearsal and the live
+Moku in a run. Every version of the package works through it, whatever it does with its address and headers: 4.3.0.1
+(MokuOS 4.0.1 to 4.3) and 4.4.0.0 (MokuOS 4.4 on), whose fast transport keeps only the host and port it is given and
+sends only its own `Moku-Client-Key`. Pick the version the device needs (`pip install moku==4.4.0.0` in the project
+for a MokuOS 4.4 Moku); InstruCore 0.27.1 or later takes 4.4's calls. `m.moku()` answers:
 
 | Argument | Value |
 | --- | --- |
-| `ip` | The lab's address without `http://`, then `/v1/moku/<machine>/<device>`. `<machine>` is the machine in the block by its public id, as `lab.machines()` lists it: the live machine, or the simulated copy the block holds, so the same script reaches the copy in a rehearsal and the live Moku in a run. The package builds `http://{ip}/api/<group>/<operation>`, so its calls reach `<QUPAI_LAB_URL>/v1/moku/<machine>/<device>/api/…`, where InstruCore answers that Moku's own HTTP API behind its checks |
-| `session_headers` | The headers of this `Lab`'s own calls: `Authorization: Bearer <key>`, `X-InstruCore-Script` (when the script has one) and `User-Agent`. The package makes them its HTTP session's headers and adds its `Moku-Client-Key`, so each call gives a new dict |
-| `manage_bitstreams` | `False`: the package uploads no FPGA bitstreams, since InstruCore uploads what the Moku lacks at the lab PC |
-| `session_hooks` | A response hook that reads the writes the lab lists in each answer (`instrucore.writes`, InstruCore 0.26.2 on), for `changes.json` ([below](#the-record-and-changesjson)) |
+| `ip` | `127.0.0.1:<port>`, the local stand-in |
+| `manage_bitstreams` | `False`: the package uploads no FPGA bitstreams (4.3), since InstruCore uploads what the Moku lacks at the lab PC. 4.4 has no such argument and reads the environment instead, so `m.moku()` also sets `MOKU_API_DISABLE_BITSTREAM_MANAGEMENT=1` in the script's environment |
+| `session_trust_env`, `session_proxies` | `False` and `{}`: the package's `requests` session reaches 127.0.0.1 directly, whatever proxy the environment names |
 
 - **The lab checks every call** as it checks this SDK's. The key tells the lab whose calls they are, so they belong
   to whatever this `Lab` holds: the block's copy, or a run's live machine. Reads pass; writes need the hold, and on a
@@ -196,9 +203,10 @@ nothing; it answers three arguments:
   `lab.changes()` lists them with this SDK's own, under the instrument's role, so a rehearsal's `changes.json` lets
   a live run make them. A lab whose InstruCore is older than 0.26.2 lists none: that is said once on stderr,
   `official_sdk` gets `"writes_listed": false`, and a live run of such a script is refused at its first write.
-- **http only.** The package builds `http://` URLs itself, so the lab must be at an http address, as a QuPai
-  sandbox's door is; an https address raises `LabError` `HTTP_ONLY`. A machine's and a device's id are letters,
-  digits, `_` and `-` (`INVALID_MACHINE`, `INVALID_DEVICE` otherwise).
+- **Any lab address.** The stand-in makes the calls, so the lab may be at an http or an https address (an address
+  that is neither raises `LabError` `INVALID_URL`). A lab that does not answer reaches the package as a refusal in
+  the Moku's envelope, code `LAB_UNREACHABLE`. A machine's and a device's id are letters, digits, `_` and `-`
+  (`INVALID_MACHINE`, `INVALID_DEVICE` otherwise).
 - **Not through the lab:** streaming (`start_streaming`, `get_stream_data`, `stream_to_file`) runs the
   manufacturer's `mokucli` against the device itself. `import moku` warns that it cannot find `mokucli`; nothing
   above needs it.
@@ -206,8 +214,8 @@ nothing; it answers three arguments:
   read_timeout=60)`. The lab needs an InstruCore that offers `/v1/moku/<machine>/<device>`; an older one answers `404`, which
   the package reports as "Method not found".
 
-`moku` is not a dependency of `qupai-lab`, which only builds its arguments: a QuPai sandbox has it, and
-`pip install "qupai-lab[moku]"` installs the version this SDK is tested with (4.3.0.1, MIT).
+`moku` is not a dependency of `qupai-lab`: a QuPai sandbox has 4.3.0.1, and `pip install "qupai-lab[moku]"` installs
+that version (MIT). The tests run with 4.3.0.1 and with 4.4.0.0.
 
 ## The record and `changes.json`
 
@@ -309,7 +317,7 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |
-| `INVALID_MACHINE`, `INVALID_DEVICE`, `HTTP_ONLY` | `m.moku()`'s own: not a plain machine or device id; the lab's address is not plain http, which the official `moku` package needs |
+| `INVALID_MACHINE`, `INVALID_DEVICE`, `INVALID_URL` | `m.moku()`'s own: not a plain machine or device id; the lab's address is not http(s)://host[:port][/path] |
 
 ## Tests
 
