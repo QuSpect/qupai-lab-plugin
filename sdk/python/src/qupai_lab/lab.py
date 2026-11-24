@@ -298,13 +298,54 @@ class Lab:
 
     def _official(self, package: str, version: str | None, m: Machine, device: str) -> None:
         """Notes in the run that ``package`` works ``device`` on ``m``: the lab records each of its calls; the
-        record file, ``calls`` and ``changes`` here see none of them."""
+        record file and ``calls`` here see none of them. Its writes reach ``changes`` from the lab's answers
+        (``_official_answer``)."""
         entry = {"package": package, "version": version, "machine": m.public_id or m.id, "device": device}
         if entry in self._official_used:
             return
         self._official_used.append(entry)
         if self.run_folder is not None:
             self.run_folder.official(entry)
+
+    def _official_answer(self, m: Machine, device: str) -> Callable[..., None]:
+        """A ``requests`` response hook for a manufacturer's SDK's session (``m.moku``): each answer the lab gives in
+        the Moku's envelope lists the writes it made (``instrucore.writes``: instrument, op and arguments, as the lab
+        matches a run's permission), and each is kept for ``changes`` under its role on ``m``. A lab whose answers
+        list none (InstruCore before 0.26.2) is said once, and ``changes`` notes it: its writes are not there."""
+        roles = {iid: role for role, iid in reversed(list(m.roles.items()))}
+        machine = m.public_id or m.target
+        said = False
+
+        def hook(response: Any, *args: Any, **kwargs: Any) -> None:
+            nonlocal said
+            try:
+                if getattr(response, "status_code", None) != 200:
+                    return
+                if not str(response.headers.get("Content-Type", "")).startswith("application/json"):
+                    return  # a file the package downloads: never a write
+                body = json.loads(response.content)
+            except (ValueError, TypeError, AttributeError):
+                return
+            if not isinstance(body, dict) or body.get("success") is not True:
+                return
+            listed = body.get("instrucore")
+            if not isinstance(listed, dict) or not isinstance(listed.get("writes"), list):
+                if not said:
+                    said = True
+                    for e in self._official_used:
+                        if e["machine"] == machine and e["device"] == device:
+                            e["writes_listed"] = False
+                    _say(f"the lab lists no writes of the {device} calls (InstruCore before 0.26.2): changes.json "
+                         "leaves them out, and a live run of this script would be refused at its first one")
+                return
+            for w in listed["writes"]:
+                if not isinstance(w, dict) or not isinstance(w.get("op"), str):
+                    continue
+                instrument = str(w.get("instrument") or "")
+                args = w.get("args") if isinstance(w.get("args"), dict) else {}
+                self._writes.append(_changes.Write(roles.get(instrument, instrument), w["op"], dict(args), machine))
+
+        return hook
 
     def _send(self, method: str, path: str, body: dict[str, Any] | None) -> _Answer:
         data = dumps(body).encode("utf-8") if body is not None else None
@@ -450,7 +491,8 @@ class Lab:
             # run.py's git blob id as it ran: the live run's card says rehearsed when its commit has this file.
             "script_blob": config.running_script_blob(),
             "machines": list(self._machines_used),
-            # A device the script worked with a manufacturer's SDK (m.moku): its writes are not among the changes.
+            # A device the script worked with a manufacturer's SDK (m.moku): its writes are among the changes when
+            # the lab listed them in its answers (InstruCore 0.26.2 on); "writes_listed": false says they are not.
             **({"official_sdk": [dict(e) for e in self._official_used]} if self._official_used else {}),
             "written_at": now_iso(),
             "changes": _changes.group(self._writes),
@@ -735,9 +777,11 @@ class Machine:
         ``ip``: the lab's address without ``http://`` and ``/v1/moku/<machine>/<device_id>``, where InstruCore
         answers the Moku's own HTTP API behind its checks; ``<machine>`` is this machine's public id, as
         ``lab.machines()`` lists it: the live machine, or the simulated copy the block holds. ``session_headers``: this Lab's key and script header, a new dict
-        each call. ``manage_bitstreams=False``: InstruCore uploads what the Moku lacks on the lab PC. Nothing is
-        called here; the package's own calls go to the lab, which records each, and the run's manifest notes the
-        device (``official_sdk``). ``moku`` is not a dependency of qupai-lab (``qupai-lab[moku]`` installs it)."""
+        each call. ``manage_bitstreams=False``: InstruCore uploads what the Moku lacks on the lab PC.
+        ``session_hooks``: reads the writes the lab lists in each answer, so a rehearsal's ``changes.json`` has them
+        and a live run's card can approve them (InstruCore 0.26.2 on). Nothing is called here; the package's own
+        calls go to the lab, which records each, and the run's manifest notes the device (``official_sdk``).
+        ``moku`` is not a dependency of qupai-lab (``qupai-lab[moku]`` installs it)."""
         if self.kind is None:
             raise LabError("NOT_HELD", f"use the machine in a block first: with lab.machine({self.target!r}) as m")
         ip = moku_address(self.lab.url, self.public_id or self.id, device_id)
@@ -745,6 +789,8 @@ class Machine:
         args = {
             "ip": ip,
             "session_headers": self.lab._official_headers("moku", version),
+            # the package sets each session_<name> on its requests session: here its response hooks
+            "session_hooks": {"response": [self.lab._official_answer(self, device_id)]},
             "manage_bitstreams": False,
         }
         self.lab._official("moku", version, self, device_id)

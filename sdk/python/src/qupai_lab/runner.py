@@ -9,12 +9,14 @@ QuPai starts it in the place's repository after the member approved the run, wit
 2. checks the commit out into ``/tmp/qupai-run-<run>`` (``git worktree add --detach``), without the commit's own
    ``data/``, ``figures/``, ``calls.jsonl`` and ``changes.json`` in the experiment's folder;
 3. runs ``python run.py <machine>`` there with those four settings (in place of any other ``QUPAI_*``); its output
-   is this command's, ``QUPAI_METRIC`` lines included. The SDK writes the script's outputs into its run folder,
-   ``runs/<run>/``, with the run's ``manifest.json`` (``qupai_lab.runs``);
+   is this command's, ``QUPAI_METRIC`` lines included, and is also kept as the run's ``output.log`` (the first
+   ``OUTPUT_MAX`` bytes). The SDK writes the script's outputs into its run folder, ``runs/<run>/``, with the run's
+   ``manifest.json`` (``qupai_lab.runs``);
 4. copies that folder, and any ``data/``, ``figures/``, ``calls.jsonl`` and ``changes.json`` the script left beside
    ``run.py`` (a script that writes its own files), to ``<experiment>/runs/<run>/`` in the repository; gives the
-   manifest the approved commit, the exit code and the status (``ended``, ``failed``, ``stopped``), writing a short
-   one when the script left none; rewrites ``experiments/INDEX.md``; and removes the checkout;
+   manifest the approved commit, the exit code and the status (``ended``, ``failed``, ``stopped``), and for a script
+   that did not end well the last lines it wrote to stderr (``error``), writing a short one when the script left
+   none; rewrites ``experiments/INDEX.md``; and removes the checkout;
 5. exits with the script's exit code (128 + the signal's number when a signal ended it).
 
 SIGTERM and SIGINT are passed to the script, which ends its held session and exits; after 20 s it is killed. What it
@@ -40,6 +42,9 @@ from qupai_lab import config
 from qupai_lab import runs as _runs
 
 GRACE_S = 20.0  # after SIGTERM or SIGINT, how long the script has to end its session before it is killed
+OUTPUT_LOG = "output.log"  # the script's stdout and stderr, kept in the run's folder
+OUTPUT_MAX = 1 << 20  # the most of it kept; the rest still reaches this command's output
+ERROR_TAIL = 2000  # how much of the end of its stderr a run that did not end well keeps in its manifest
 OUTPUTS = ("data", "figures", "calls.jsonl", "changes.json")
 KEYS = (config.URL_ENV, config.KEY_ENV, config.RUN_ENV, config.RUN_MACHINE_ENV)
 CANNOT_START = 2
@@ -207,6 +212,62 @@ def copy_run(folder: Path, run_id: str, dest: Path) -> list[str]:
     return kept
 
 
+class _Output:
+    """The script's stdout and stderr: each passes on to this command's own as it arrives, and both go into one log
+    (the first ``OUTPUT_MAX`` bytes) that the run keeps; the end of stderr is kept for the manifest."""
+
+    def __init__(self, log: Path) -> None:
+        self.log = log
+        self._file = log.open("wb")
+        self._lock = threading.Lock()
+        self._written = 0
+        self._cut = False
+        self._tail = bytearray()
+        self._threads: list[threading.Thread] = []
+
+    def follow(self, stream: Any, sink: Any, *, stderr: bool) -> None:
+        t = threading.Thread(target=self._copy, args=(stream, sink, stderr), daemon=True)
+        t.start()
+        self._threads.append(t)
+
+    def _copy(self, stream: Any, sink: Any, stderr: bool) -> None:
+        for chunk in iter(lambda: stream.read1(65536) if hasattr(stream, "read1") else stream.read(65536), b""):
+            try:
+                sink.write(chunk)
+                sink.flush()
+            except (OSError, ValueError):
+                pass
+            with self._lock:
+                if stderr:
+                    self._tail = (self._tail + chunk)[-ERROR_TAIL * 4:]
+                if self._written < OUTPUT_MAX:
+                    part = chunk[: OUTPUT_MAX - self._written]
+                    self._file.write(part)
+                    self._written += len(part)
+                elif not self._cut:
+                    self._cut = True
+                    self._file.write(f"\n[qupai-lab: the output goes on; {OUTPUT_MAX} bytes are kept]\n".encode())
+        stream.close()
+
+    def close(self) -> None:
+        for t in self._threads:
+            t.join(timeout=5)
+        with self._lock:
+            self._file.close()
+
+    def error(self) -> str | None:
+        """The last lines of the script's stderr (at most ``ERROR_TAIL`` characters), or None when it wrote none."""
+        text = self._tail.decode("utf-8", "replace").strip()
+        if not text:
+            return None
+        text = text[-ERROR_TAIL:]
+        return text.split("\n", 1)[1] if "\n" in text and len(self._tail) > ERROR_TAIL else text
+
+
+def _sink(stream: Any) -> Any:
+    return getattr(stream, "buffer", stream)
+
+
 def _environment(settings: dict[str, str]) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("QUPAI_")}
     env.update(settings)
@@ -259,10 +320,16 @@ def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _S
         if signals.signum is not None:
             return 128 + signals.signum
         _say(f"run {run_id}: {folder_rel.as_posix()}/run.py at {sha[:7]} on {machine}")
+        output = _Output(tree.with_name(tree.name + ".output.log"))
         try:
-            proc = subprocess.Popen([sys.executable, "run.py", machine], cwd=folder, env=_environment(settings))
+            proc = subprocess.Popen([sys.executable, "run.py", machine], cwd=folder, env=_environment(settings),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as e:
+            output.close()
+            output.log.unlink(missing_ok=True)
             raise RunError(f"could not start {sys.executable}: {e}") from e
+        output.follow(proc.stdout, _sink(sys.stdout), stderr=False)
+        output.follow(proc.stderr, _sink(sys.stderr), stderr=True)
         code: int | None = None
         try:
             signals.started(proc)
@@ -273,16 +340,24 @@ def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _S
                 proc.wait()
             if code is None:  # this process was interrupted while it waited
                 code = 128 - proc.returncode if proc.returncode < 0 else proc.returncode
+            output.close()
             dest = repo / folder_rel / _runs.RUNS / run_id
             try:
                 kept = copy_run(folder, run_id, dest)
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(output.log, dest / OUTPUT_LOG)
+                if OUTPUT_LOG not in kept:
+                    kept.append(OUTPUT_LOG)
             except OSError as e:
                 _say(f"run {run_id}: could not copy the outputs to {dest}: {e}")
                 kept = None
+            finally:
+                output.log.unlink(missing_ok=True)
             if kept is not None:
                 try:
                     _runs.finish_live(dest, run_id=run_id, experiment=folder_rel.as_posix(), commit=sha,
-                                      machine=machine, exit_code=code, stopped=signals.signum is not None)
+                                      machine=machine, exit_code=code, stopped=signals.signum is not None,
+                                      error=output.error() if code != 0 else None)
                     experiments = _runs.index_folder(repo / folder_rel)
                     if experiments is not None:
                         _runs.write_index(experiments)

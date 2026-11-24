@@ -139,7 +139,8 @@ def test_run_end_to_end(live: FakeInstruCore, tmp_path: Path, run_id: str, monke
 
     runs = place / EXPERIMENT / "runs" / run_id
     assert sorted(p.relative_to(runs).as_posix() for p in runs.rglob("*") if p.is_file()) == [
-        "calls.jsonl", "changes.json", "data/env.json", "figures/response.txt", "manifest.json"]  # no rehearsal output
+        "calls.jsonl", "changes.json", "data/env.json", "figures/response.txt", "manifest.json",
+        "output.log"]  # no rehearsal output
     manifest = json.loads((runs / "manifest.json").read_text())
     assert {k: manifest[k] for k in ("run", "kind", "simulated", "experiment", "script", "argv", "commit", "dirty",
                                      "status", "exit_code", "calls")} == {
@@ -149,7 +150,8 @@ def test_run_end_to_end(live: FakeInstruCore, tmp_path: Path, run_id: str, monke
     assert (held["requested"], held["machine"], held["kind"], held["held"]) == ("signal-bench", "signal-bench", "live",
                                                                               True)
     assert held["session"] and held["released_at"]
-    assert manifest["outputs"] == ["calls.jsonl", "changes.json", "data/env.json", "figures/response.txt"]
+    assert manifest["outputs"] == [
+        "calls.jsonl", "changes.json", "data/env.json", "figures/response.txt", "output.log"]
     index = (place / "experiments" / "INDEX.md").read_text()
     assert f"| [{run_id}](2026-11-21-freq/runs/{run_id}/) | live | signal-bench | {sha[:7]} |" in index
     seen = json.loads((runs / "data/env.json").read_text())
@@ -174,7 +176,7 @@ def test_run_end_to_end(live: FakeInstruCore, tmp_path: Path, run_id: str, monke
     out, err = capfd.readouterr()
     assert points(out) == [("held", 1), ("calls", 1), ("held", 0)]
     assert f"run {run_id}: {EXPERIMENT}/run.py at {sha[:7]} on signal-bench" in err
-    assert (f"run {run_id}: the script exited with 3; kept calls.jsonl, changes.json, data/, figures/ in "
+    assert (f"run {run_id}: the script exited with 3; kept calls.jsonl, changes.json, data/, figures/, output.log in "
             f"{EXPERIMENT}/runs/{run_id}/") in err
 
 
@@ -185,12 +187,16 @@ def test_a_failing_script_still_leaves_its_outputs(live: FakeInstruCore, tmp_pat
     monkeypatch.chdir(place)
     assert main(argv(rel, sha)) == 1
     runs = place / EXPERIMENT / "runs" / run_id
-    assert sorted(p.name for p in runs.iterdir()) == ["calls.jsonl", "manifest.json"]
+    assert sorted(p.name for p in runs.iterdir()) == ["calls.jsonl", "manifest.json", "output.log"]
     manifest = json.loads((runs / "manifest.json").read_text())
     assert (manifest["status"], manifest["exit_code"]) == ("failed", 1)
     end = live.calls("POST", "/v1/machines/bench/sessions/end")
     assert [s.body["reason"] for s in end] == ["qupai-lab: the script's block raised"]
-    assert "RuntimeError: the script failed" in capfd.readouterr().err
+    assert "RuntimeError: the script failed" in capfd.readouterr().err  # still this command's output
+    # and kept with the run: the whole output, and the end of stderr in the manifest
+    assert "RuntimeError: the script failed" in (runs / "output.log").read_text()
+    assert manifest["error"].rstrip().endswith("RuntimeError: the script failed")
+    assert "output.log" in manifest["outputs"]
 
 
 @pytest.mark.parametrize(
@@ -243,7 +249,7 @@ def test_sigterm_ends_the_runs_session_and_keeps_what_it_wrote(live: FakeInstruC
     assert proc.wait(timeout=30) == 143
     err = proc.stderr.read()
     assert "SIGTERM: stopping the script (killed after 20 s)" in err
-    assert f"the script exited with 143; kept calls.jsonl in {EXPERIMENT}/runs/{run_id}/" in err
+    assert f"the script exited with 143; kept calls.jsonl, output.log in {EXPERIMENT}/runs/{run_id}/" in err
     end = live.calls("POST", "/v1/machines/bench/sessions/end")
     assert [s.body["reason"] for s in end] == ["qupai-lab: stopped by SIGTERM"]
     assert live.sessions == {}
@@ -279,4 +285,4 @@ def test_a_script_that_does_not_stop_is_killed_after_the_grace(fake: FakeInstruC
     # A script without the SDK leaves no manifest: the runner writes a short one.
     manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
     assert {k: manifest[k] for k in ("run", "kind", "commit", "status", "exit_code", "outputs")} == {
-        "run": run_id, "kind": "live", "commit": sha, "status": "stopped", "exit_code": 137, "outputs": ["data/started"]}
+        "run": run_id, "kind": "live", "commit": sha, "status": "stopped", "exit_code": 137, "outputs": ["data/started", "output.log"]}

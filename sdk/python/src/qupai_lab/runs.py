@@ -264,9 +264,10 @@ class RunFolder:
 
 
 def finish_live(dest: Path, *, run_id: str, experiment: str, commit: str, machine: str, exit_code: int,
-                stopped: bool) -> None:
+                stopped: bool, error: str | None = None) -> None:
     """``qupai-lab run`` after a live run's script: the manifest the script left in ``dest`` (or a short one when it
-    left none) gets the approved commit, the exit code and its status from it."""
+    left none) gets the approved commit, the exit code and its status from it; a script that did not end well, the
+    last lines of its stderr (``error``)."""
     path = dest / MANIFEST
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -283,6 +284,8 @@ def finish_live(dest: Path, *, run_id: str, experiment: str, commit: str, machin
                     status="ended" if exit_code == 0 else "stopped" if stopped or exit_code in STOPPED_CODES
                     else "failed")
     manifest["ended_at"] = manifest.get("ended_at") or now_iso()
+    if error:
+        manifest["error"] = error
     manifest["outputs"], manifest["raw_files"] = _files(dest)
     _write_json(path, manifest)
 
