@@ -6,6 +6,10 @@ session on the bench with the queue on, and write there while it holds it. A key
 who works the lab directly (a token without ``script``): it may hold the bench too, and asking again while it
 holds it answers the same session, as InstruCore does for the same caller.
 
+``end_by_other(machine)`` ends a machine's session as someone else would (the bench page, the lab's admin): the key
+that held it is then answered as InstruCore answers a caller that holds the machine no more, ``BENCH_NOT_HELD`` on
+the bench (``SESSION_REQUIRED`` on a copy), or ``BENCH_HELD`` while another holds it, also through the Moku endpoint.
+
 ``/v1/moku/<machine>/<device>/api/<group>/<operation>`` stands in for InstruCore's copy of a Moku's own HTTP API
 (the endpoint for the official moku package), on a machine the fake knows: the Moku's answers in its own envelope (``success``, ``data``,
 ``messages``, ``code``) and a ``Moku-Client-Key`` with the claim. ``prefix`` mounts the lab under a path, as a
@@ -82,6 +86,7 @@ class FakeInstruCore:
         self.run_keys: set[str] = set()  # keys of live runs on the bench
         self.direct_keys: set[str] = set()  # keys of people who work the lab directly
         self.holders: dict[str, str] = {}  # machine → the key that started its session
+        self.ended: dict[str, str] = {}  # machine → the key whose session someone else ended (end_by_other)
         self.before: dict[tuple[str, str], Callable[[], None]] = {}  # called as that request arrives
         self.moku_refusal: str | None = None  # set: every Moku call is refused with it, in the Moku's envelope
         # set to a role: the Moku's answers list their writes (instrucore.writes, InstruCore 0.26.2) as made on the
@@ -116,6 +121,31 @@ class FakeInstruCore:
     def respond(self, method: str, path: str, status: int, body: Any, **kw: Any) -> None:
         """The next ``times`` requests to ``method path`` get this answer instead of the fake's own."""
         self.canned.append(Canned(method, path, status, body, **kw))
+
+    def end_by_other(self, machine: str, holder: str | None = None) -> None:
+        """Ends ``machine``'s session as someone other than its holder; ``holder`` (a name) then holds it."""
+        with self.lock:
+            key = self.holders.pop(machine, "")
+            self.sessions.pop(machine, None)
+            self.ended[machine] = key
+            if holder is not None:
+                self._n += 1
+                self.sessions[machine] = {"session_id": f"s_{self._n:04d}", "machine": machine, "client_id": "other",
+                                          "client_name": holder, "purpose": "", "project": None,
+                                          "started_at": "2026-11-21T11:00:00.000Z", "expires_in_s": 900.0}
+                self.holders[machine] = "other"
+
+    def _not_holding(self, machine: str, key: str) -> tuple[int, Any] | None:
+        """InstruCore's refusal of a write by ``key`` after someone else ended its session on ``machine``."""
+        if key == "" or self.ended.get(machine) != key or self.holders.get(machine) == key:
+            return None
+        other = self.sessions.get(machine)
+        if other is not None:
+            return 409, _err("BENCH_HELD", f"实验台正由 {other['client_name']} 使用；可以读，写需要排队", machine=machine,
+                             holder={"client_name": other["client_name"], "since": other["started_at"]})
+        if machine == "bench":
+            return 409, _err("BENCH_NOT_HELD", "写操作需要先占用实验台", machine=machine)
+        return 409, _err("SESSION_REQUIRED", "写操作需要先开始这台机器的会话", machine=machine)
 
     def calls(self, method: str | None = None, prefix: str = "") -> list[Seen]:
         return [s for s in self.seen if (method is None or s.method == method) and s.path.startswith(prefix)]
@@ -161,7 +191,8 @@ class FakeInstruCore:
         self._n += 1
         s = {"session_id": f"s_{self._n:04d}", "machine": copy, "instruments": list(_instrument_ids(copy).values()),
              "client_id": "qupai:t:u", "client_name": "Ada", "purpose": purpose, "project": None,
-             "started_at": "2026-11-21T10:00:00.000Z", "expires_in_s": 900.0, "limits": {}}
+             "started_at": "2026-11-21T10:00:00.000Z", "expires_in_s": 900.0, "idle_expires_in_s": 900.0,
+             "max_expires_in_s": 1800.0, "limits": {}}
         self.sessions[copy] = s
         return s
 
@@ -208,10 +239,15 @@ class FakeInstruCore:
                     r["position"] = max(1, r["position"] - 1)
             return 200, r
         if method == "POST" and len(rest) == 4 and rest[0] == "instruments":
-            return self._op(rest[1], rest[2], rest[3], body or {})
+            return self._op(rest[1], rest[2], rest[3], body or {}, key)
         if len(rest) >= 5 and rest[0] == "moku" and rest[3] == "api":
             if _internal(rest[1]) not in ("bench", *COPIES):
                 return 404, _err("NOT_FOUND", f"机器 {rest[1]} 不存在", resource="machine")
+            refused = self._not_holding(_internal(rest[1]), key)
+            if refused is not None:  # InstruCore answers it in the Moku's envelope
+                error = refused[1]["error"]
+                return 200, {"success": False, "data": None, "code": error["code"], "messages": [error["message"]],
+                             "detail": error["detail"]}
             return self._moku(method, "/".join(rest[4:]), body, _internal(rest[1]))
         return 404, _err("NOT_FOUND", f"no route {method} {path}")
 
@@ -298,10 +334,13 @@ class FakeInstruCore:
             return 409, _err("MACHINE_IN_SESSION", f"{target} 正在使用中", machine=target)
         return 201, self._session(free[0], body.get("purpose", ""))
 
-    def _op(self, inst: str, kind: str, op: str, args: dict[str, Any]) -> tuple[int, Any]:
+    def _op(self, inst: str, kind: str, op: str, args: dict[str, Any], key: str = "") -> tuple[int, Any]:
         owner = next((m for m in ("bench", *COPIES) if inst in _instrument_ids(m).values()), None)
         if owner is None:
             return 404, _err("NOT_FOUND", f"仪器 {inst} 不存在", resource="instrument")
+        refused = self._not_holding(owner, key) if kind == "write" else None
+        if refused is not None:
+            return refused
         self._n += 1
         req_id = f"r{self._n:015d}"
         if kind == "check":

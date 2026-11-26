@@ -1,7 +1,7 @@
 {
   "name": "qupai-lab",
   "displayName": "QuPai Lab",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Work with a QuPai lab from Claude Code: the lab's instruments as tools through QuPai, how to operate them safely, and its live page in the browser.",
   "author": {
     "name": "QuSpect"

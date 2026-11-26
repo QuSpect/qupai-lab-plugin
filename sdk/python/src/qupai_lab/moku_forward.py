@@ -7,6 +7,8 @@ it does with the address it is given or with its headers: 4.3 builds ``http://{i
 session, while 4.4's fast transport keeps only the host and port of ``ip`` and sends only its ``Moku-Client-Key``.
 
 Each JSON answer is also handed to ``on_answer`` (the Lab keeps the writes the lab lists in it for ``changes``).
+Once ``refuse`` answers a sentence (a live run whose session ended), nothing more is passed on: each call is refused
+here with it (``SESSION_ENDED``), and handing the Moku back succeeds, since there is nothing to hand back.
 Standard library only, as the rest of the Lab SDK.
 """
 
@@ -40,10 +42,11 @@ class Forwarder:
     ``target`` (``<lab>/v1/moku/<machine>/<device>``)."""
 
     def __init__(self, target: str, headers: dict[str, str], on_answer: Callable[[int, str, bytes], None],
-                 opener: Callable[..., Any] | None = None) -> None:
+                 opener: Callable[..., Any] | None = None, refuse: Callable[[], str | None] | None = None) -> None:
         self.target = target.rstrip("/")
         self.headers = dict(headers)
         self.on_answer = on_answer
+        self.refuse = refuse or (lambda: None)
         # How a call goes to the lab: the Lab's own way (straight, or through a lab workstation's door).
         self._open = opener or urllib.request.urlopen
         forwarder = self
@@ -90,6 +93,14 @@ class Forwarder:
             return
         if not h.path.startswith("/api/"):
             self._reply(h, 404, "application/json", _envelope("NOT_FOUND", f"{h.path} is not a Moku API path"), {})
+            return
+        stopped = self.refuse()
+        if stopped is not None:
+            if h.path.rstrip("/") == "/api/moku/relinquish_ownership":
+                done = json.dumps({"success": True, "data": "Ownership relinquished", "code": None, "messages": []})
+                self._reply(h, 200, "application/json", done.encode(), {})
+            else:
+                self._reply(h, 200, "application/json", _envelope("SESSION_ENDED", stopped), {})
             return
         headers = {k: h.headers[k] for k in PASSED_ON if h.headers.get(k)}
         headers.update(self.headers)

@@ -14,6 +14,8 @@ from qupai_lab import Lab, LabError
 from qupai_lab import lab as lab_module
 
 RUN_KEY = "qrk_run_7"
+# The fake's sessions start at 2026-11-21T10:00:00.000Z: the run's held_since, in seconds since the epoch.
+SINCE = 1795255200.0
 # The QuPai Runtime's rule (qupai_runtime/platform/jobs.py, metric_points): a line that starts with this marker and
 # a JSON object; {"key": k, "value": v} is one point of k, a name of these characters, v a finite number.
 MARKER = "QUPAI_METRIC "
@@ -68,7 +70,7 @@ def test_the_runs_live_machine_is_held_through_its_queue(
     assert fake.sessions == {} and not m.held
     out = capsys.readouterr()
     assert points(out.out) == [("queue_position", 3), ("queue_position", 2), ("queue_position", 1), ("held", 1),
-                               ("calls", 1), ("held", 0)]
+                               ("held_since", SINCE), ("calls", 1), ("held", 0)]
     assert "queued for signal-bench at position 3; waiting for its turn" in out.err
 
 
@@ -114,7 +116,7 @@ def test_a_runs_session_is_released_when_the_block_raises(
     end = fake.calls("POST", "/v1/machines/bench/sessions/end")
     assert [s.body["reason"] for s in end] == ["qupai-lab: the script's block raised"]
     assert fake.sessions == {}
-    assert points(capsys.readouterr().out) == [("held", 1), ("held", 0)]
+    assert points(capsys.readouterr().out) == [("held", 1), ("held_since", SINCE), ("held", 0)]
 
 
 def test_a_refused_run_session_is_passed_through(
@@ -139,7 +141,8 @@ def test_the_calls_point_is_said_at_most_every_few_seconds_and_at_the_end(
         for f in (100, 300, 1000, 3000):
             gen.write("set_waveform", channel=1, frequency_hz=f)
         gen.read("get_waveform", channel=1)
-    assert points(capsys.readouterr().out) == [("held", 1), ("calls", 1), ("calls", 5), ("held", 0)]
+    assert points(capsys.readouterr().out) == [("held", 1), ("held_since", SINCE), ("calls", 1), ("calls", 5),
+                                               ("held", 0)]
 
 
 def test_outside_a_run_nothing_is_printed_on_stdout(lab: Lab, fake: FakeInstruCore, capsys) -> None:

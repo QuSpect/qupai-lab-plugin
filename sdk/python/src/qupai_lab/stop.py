@@ -10,10 +10,14 @@ While any machine is held (``hold`` … ``unhold``) one handler serves both sign
 
 When nothing is held any more the handlers the script had are back. A signal set to be ignored stays ignored, and
 outside the main thread nothing is installed (Python runs handlers only there).
+
+``interrupt`` stops the script the same way from another thread (a Moku's local stand-in that learns the run's
+session is gone): the exception it is given is raised in the main thread, as a signal's would be.
 """
 
 from __future__ import annotations
 
+import _thread
 import signal
 import sys
 import threading
@@ -29,6 +33,8 @@ _previous: dict[int, Any] = {}
 _shield = 0
 _deferred: int | None = None
 _stopping: int | None = None
+_pending: BaseException | None = None  # ``interrupt``'s exception, raised by the handler in the main thread
+_pending_lock = threading.Lock()  # ``interrupt`` (another thread) against ``unhold`` (the main thread)
 
 
 def name(signum: int) -> str:
@@ -54,12 +60,39 @@ def _stop(signum: int) -> BaseException:
 
 def _handler(signum: int, _frame: FrameType | None) -> None:
     global _deferred
+    if _shield:
+        if _pending is None:
+            _deferred = _deferred or signum
+        return
+    exc = _take()
+    if exc is not None:
+        raise exc
     if _stopping is not None:
         return
-    if _shield:
-        _deferred = _deferred or signum
-        return
     raise _stop(signum)
+
+
+def _take() -> BaseException | None:
+    global _pending
+    with _pending_lock:
+        exc, _pending = _pending, None
+    return exc
+
+
+def interrupt(exc: BaseException) -> bool:
+    """Raises ``exc`` in the main thread, from another thread, as a signal stops the script: at once, or once a
+    session that is starting or ending is done. Only while a machine is held (the handler is installed); False when
+    it could not be delivered (nothing held, or the script ignores both signals). SIGTERM's handler carries it when
+    it is installed: SIGTERM's default is not a Python handler, so a delivery that comes after the block ended does
+    nothing."""
+    global _pending
+    with _pending_lock:
+        signum = next((s for s in SIGNALS if s in _previous), None)
+        if _depth == 0 or signum is None:
+            return False
+        _pending = exc
+        _thread.interrupt_main(signum)
+    return True
 
 
 def hold() -> bool:
@@ -82,13 +115,15 @@ def hold() -> bool:
 
 def unhold() -> None:
     """A machine held with ``hold`` is released: the last one puts the script's own handlers back."""
-    global _depth, _deferred, _stopping
+    global _depth, _deferred, _stopping, _pending
     _depth = max(0, _depth - 1)
     if _depth:
         return
-    for signum, previous in _previous.items():
-        signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
-    _previous.clear()
+    with _pending_lock:
+        for signum, previous in _previous.items():
+            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
+        _previous.clear()
+        _pending = None
     _deferred = None
     _stopping = None
 
@@ -102,6 +137,10 @@ def shielded() -> Iterator[None]:
         yield
     finally:
         _shield -= 1
+        exc = _take() if _shield == 0 else None
+        if exc is not None:
+            _deferred = None
+            raise exc
         if _shield == 0 and _deferred is not None and _stopping is None:
             signum, _deferred = _deferred, None
             raise _stop(signum)

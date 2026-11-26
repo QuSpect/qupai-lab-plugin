@@ -25,6 +25,25 @@ class LabError(Exception):
         self.status = status
 
 
+class RunSessionEnded(SystemExit):
+    """Inside a live run: the session the run held on its machine ended while the script ran, and not by the run
+    (someone ended it from the bench page or as the lab's admin, or the lab ended it at the run's longest time or
+    after its idle limit). The run stops: this is a ``SystemExit`` (exit status 1), so ``except Exception`` does not
+    catch it, and every later call through the same ``Lab`` raises it again without reaching the lab. ``message``
+    says what happened, ``detail`` the machine, the session and the lab's refusal; ``code`` is the exit status, and
+    ``error_code`` is ``SESSION_ENDED``."""
+
+    error_code = "SESSION_ENDED"
+
+    def __init__(self, message: str, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(1)
+        self.message = message
+        self.detail = detail or {}
+
+    def __str__(self) -> str:
+        return f"{self.error_code}: {self.message}"
+
+
 def from_response(status: int, body: bytes, content_type: str = "") -> LabError:
     """The error an answer of ``status`` (400 or more) carries.
 
