@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fake_instrucore import FakeInstruCore  # noqa: E402
 
-from qupai_lab import Lab, config  # noqa: E402
+from qupai_lab import Lab, config, direct  # noqa: E402
 
 
 @pytest.fixture
@@ -32,10 +32,15 @@ def lab(fake: FakeInstruCore, tmp_path: Path) -> Lab:
 
 @pytest.fixture(autouse=True)
 def _no_ambient_lab(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """No test reads the developer's own QUPAI_LAB_* settings or /workspace/project/.env."""
+    """No test reads the developer's own QUPAI_LAB_* settings, /workspace/project/.env, qupai sign-in or lab
+    workstation's door."""
     monkeypatch.delenv("QUPAI_LAB_URL", raising=False)
     monkeypatch.delenv("QUPAI_LAB_KEY", raising=False)
     monkeypatch.setattr(config, "PROJECT_ENV", tmp_path / "no-project" / ".env")
+    monkeypatch.setenv(direct.CREDENTIALS_ENV, str(tmp_path / "no-signin" / "credentials.json"))
+    monkeypatch.delenv(direct.SOCKET_ENV, raising=False)
+    monkeypatch.delenv(direct.GATEWAY_ENV, raising=False)
+    monkeypatch.setattr(direct, "WORKSTATION_SOCKET", tmp_path / "no-workstation" / "lab.sock")
 
 
 def lines(path: Path) -> list[dict[str, Any]]:

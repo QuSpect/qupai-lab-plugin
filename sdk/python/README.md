@@ -2,8 +2,9 @@
 
 Work a QuPai lab's instruments from Python: the lab's machines, sessions on simulated copies, instruments by
 role, the files an experiment keeps, and live runs in the lab's queue. It calls InstruCore's own REST API (not
-MCP), so one script runs in a QuPai lab project's sandbox and at the lab PC. Python 3.10 or later, standard
-library only.
+MCP), so one script runs in a QuPai lab project's sandbox, at the lab PC, and outside QuPai with your own `qupai`
+sign-in on a lab you may work directly ([below](#outside-qupai-with-your-own-sign-in)). Python 3.10 or later,
+standard library only.
 
 ## Install
 
@@ -11,7 +12,8 @@ library only.
 pip install qupai-lab
 ```
 
-A QuPai sandbox has it already. From a checkout of this repository instead: `pip install ./sdk/python`.
+A QuPai sandbox has it already; on your own machine or a lab workstation, install it as above. From a checkout of
+this repository instead: `pip install ./sdk/python`.
 
 **Releasing.** A tag `sdk-vX.Y.Z` on this repository, equal to `qupai_lab.__version__`, runs
 `.github/workflows/sdk-release.yml`: it tests the SDK on Python 3.10 and 3.13, builds the sdist and the wheel, checks
@@ -28,7 +30,8 @@ signal-bench-sim      pool       3 of 4 free
   …
 ```
 
-`qupai-lab machines --json` prints the same as JSON; `qupai-lab --version` the version.
+`qupai-lab machines --json` prints the same as JSON; `qupai-lab --version` the version. Outside QuPai,
+`qupai-lab machines --lab magnetic` is the same check for a lab you may work directly ([below](#outside-qupai-with-your-own-sign-in)).
 
 ## Where the lab is
 
@@ -36,6 +39,32 @@ signal-bench-sim      pool       3 of 4 free
 from the working directory, else from `/workspace/project/.env`. In a QuPai lab project the project's `.env`
 holds both: the lab's address at the sandbox door and the project key. At a lab PC, give InstruCore's address and
 a local key: `Lab("http://127.0.0.1:59220", "ick_…")`.
+
+### Outside QuPai, with your own sign-in
+
+`Lab.from_qupai("magnetic")` works a lab you may work directly, with no `.env`: a lab QuPai staff granted to your
+account, or to the lab workstation you sit at (QuPai staff may work every lab). It takes `record` and `runs` as
+`from_env` does, and the rest of the script is the same as in a QuPai sandbox, except that `lab.machine()` holds
+a live machine for its block as your own session ([below](#what-holds-a-machine)).
+
+1. It reads your `qupai` sign-in (`qupai login`): the file `QUPAI_CREDENTIALS` names, else
+   `qupai/credentials.json` in your configuration directory (`~/Library/Application Support` on macOS,
+   `$XDG_CONFIG_HOME` or `~/.config` on Linux, `%AppData%` on Windows). Its `server` is the platform and its
+   `api_key` your personal API key, which goes only into `Authorization` and is never printed or recorded. A device
+   sign-in has no key: run `qupai login` again.
+2. It asks the platform which labs you may work directly from where you are (`GET /v1/me/lab-access`) and finds the
+   lab there, by its id (`magnetic`) or its listing (`lab-magnetic`). A lab it does not list raises
+   `NO_DIRECT_ACCESS`, naming the labs you may work directly. For any other lab, ask its agent
+   (`qupai ask -lab <lab> "…"`, or the `ask` tool of `qupai mcp`): the agent does the lab work in QuPai.
+3. It speaks InstruCore's REST API at `<platform>/rest/<listing>/` with your key, as `Lab(url, key)` does
+   (`QUPAI_GATEWAY` names another gateway, as for `qupai mcp`). QuPai's gateway checks your grant at every call, and
+   the lab applies its own limits and roles, as for anyone.
+
+**On a lab workstation** every call, the first question included, goes through the workstation's door: a local
+socket, `QUPAI_WORKSTATION_LAB_SOCKET`, else `/Library/QuPai/workstation/lab.sock` when it exists. The door adds the
+workstation's own credential, which no seat can read, so a grant to the workstation counts on the workstation and
+nowhere else; your key on another machine carries no such grant. `m.moku()`'s calls take the same way.
+`Lab(url, key, unix_socket=…)` sends a `Lab`'s requests through any such socket.
 
 ## A script
 
@@ -114,7 +143,7 @@ experiments/
 `manifest.json` says what ran and how it ended: `run`, `kind` (`rehearsal` or `live`), `simulated` (every machine
 held was a simulated copy), `experiment`, `script` and `script_blob` (its git blob id), `argv`, `commit` and
 `dirty` (the experiment differed from the commit, `runs/` aside), `inputs` (each file of `inputs/` with its size and
-blob id), `lab` (the listing, from a sandbox door's address; no address is kept), `machines` (each one used:
+blob id), `lab` (the listing, from a sandbox door's or the gateway's REST door's address; no address is kept), `machines` (each one used:
 `requested`, `machine`, `kind`, `session`, `held`, `held_at`, `released_at`), `official_sdk` (each device worked with
 a manufacturer's own package, [`m.moku()`](#a-moku-with-the-official-sdk): `package`, `version`, `machine`, `device`;
 the lab records those calls), `started_at`, `ended_at`, `status`
@@ -141,8 +170,10 @@ only when given (`run_folder=`).
 | One simulated copy (`signal-bench-sim-2`) | That copy, the same way |
 | The run's live machine, inside a [live run](#live-runs) (`QUPAI_LAB_RUN_MACHINE`, by id or public id) | Held for the block: `POST sessions` with `{"purpose": "run <run id>", "queue": true}`. While others hold or wait for it, the block waits in the machine's queue and asks again when it is offered; the lab holds it for the run's longest time. Released at the block's end, as a copy is |
 | Any other live machine (`signal-bench`) | Nothing is held. The member holds a live machine, in the conversation; the lab answers a script's session there with `RUN_REQUIRED` and a write the member did not allow with `APPROVAL_REQUIRED` |
+| A live machine of a lab worked directly ([`Lab.from_qupai`](#outside-qupai-with-your-own-sign-in)) | Held for the block as your own session: `POST sessions` with `{"purpose": <the block's purpose, else the script>, "queue": true}`, waiting in the machine's queue while others hold it. Your role on the bench decides (operate holds it; view is `FORBIDDEN`), and the lab's limits hold. A session you already held when the block began (`start_session` in `qupai mcp`, say) is used and stays held at the block's end |
 
-Code holds a live machine only as a run the member approved. Rehearse on a copy first.
+In a QuPai sandbox, code holds a live machine only as a run the member approved; outside QuPai, only on a lab you
+may work directly. Rehearse on a copy first when the lab has one.
 
 SIGTERM and SIGINT while a block holds a machine (a copy, or a run's live machine) release it before the script
 exits: the first one raises `SystemExit(143)` (SIGTERM) or `KeyboardInterrupt` (SIGINT) in the block, the block's
@@ -318,6 +349,7 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |
 | `INVALID_MACHINE`, `INVALID_DEVICE`, `INVALID_URL` | `m.moku()`'s own: not a plain machine or device id; the lab's address is not http(s)://host[:port][/path] |
+| `NOT_SIGNED_IN`, `NO_DIRECT_ACCESS`, `NOT_OFFERED` | `Lab.from_qupai`'s own: no `qupai` sign-in with a personal key here (run `qupai login`); a lab you may not work directly from here (the message names the labs you may; ask the lab's agent for the others); a platform that does not say which labs yet (`GET /v1/me/lab-access` answered 404) |
 
 ## Tests
 
@@ -327,7 +359,8 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[moku]" pytest
 .venv/bin/pytest -q
 ```
 
-They run against a fake InstruCore in a thread; `tests/test_moku_official.py` drives the official `moku` package
+They run against a fake InstruCore in a thread (`tests/test_direct.py`: the same fake as the platform's REST door,
+over TCP and over a Unix socket as a workstation's door); `tests/test_moku_official.py` drives the official `moku` package
 through `m.moku()` against the fake's stand-in for InstruCore's Moku endpoint, and is skipped when the package is not
 installed (`pip install -e . pytest` without the extra); `qupai-lab run`'s tests make git repositories under the test's
 temporary folder and checkouts in `/tmp/qupai-run-<run>`, and send signals to scripts in subprocesses. `tests/test_integration.py` also runs against a real InstruCore

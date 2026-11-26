@@ -18,6 +18,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from typing import Any
 
 # How long one call may take at the lab: longer than any the package waits for (a deploy that first uploads
 # instrument files takes up to 420 s at InstruCore). The package's own timeouts still apply on its side.
@@ -38,10 +39,13 @@ class Forwarder:
     """One device's stand-in: a small threaded HTTP server on 127.0.0.1 that passes every ``/api/…`` request on to
     ``target`` (``<lab>/v1/moku/<machine>/<device>``)."""
 
-    def __init__(self, target: str, headers: dict[str, str], on_answer: Callable[[int, str, bytes], None]) -> None:
+    def __init__(self, target: str, headers: dict[str, str], on_answer: Callable[[int, str, bytes], None],
+                 opener: Callable[..., Any] | None = None) -> None:
         self.target = target.rstrip("/")
         self.headers = dict(headers)
         self.on_answer = on_answer
+        # How a call goes to the lab: the Lab's own way (straight, or through a lab workstation's door).
+        self._open = opener or urllib.request.urlopen
         forwarder = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -91,7 +95,7 @@ class Forwarder:
         headers.update(self.headers)
         req = urllib.request.Request(self.target + h.path, data=body if body else None, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_S) as r:
+            with self._open(req, timeout=UPSTREAM_TIMEOUT_S) as r:
                 status, answer, back = r.status, r.read(), r.headers
         except urllib.error.HTTPError as e:  # the lab's answer all the same (a 404 of an older InstruCore, a 401)
             status, answer, back = e.code, e.read(), e.headers

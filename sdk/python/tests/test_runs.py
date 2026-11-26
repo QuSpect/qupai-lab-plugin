@@ -178,6 +178,7 @@ def test_the_index_lists_experiments_newest_first(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(("url", "name"), [("http://172.17.0.1:18399/lab/lab-sim", "lab-sim"),
                                            ("http://door/lab/lab-sim/", "lab-sim"),
+                                           ("https://qupai.example/rest/lab-magnetic", "lab-magnetic"),
                                            ("https://instrucore.local:8443", None), ("http://x/lab", None)])
 def test_only_a_listing_is_kept_of_the_labs_address(url: str, name: str | None) -> None:
     assert runs.lab_name(url) == name

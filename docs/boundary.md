@@ -8,8 +8,10 @@ reached through QuPai's gateway at `<gateway>/mcp/lab-<lab id>`; QuPai's sign-in
 lab's benches decide what a call may do. The live page is QuPai's web app (`/lab/bench/lab-<lab id>`, with
 `?machine=<bench id>` for one bench).
 The Lab SDK (`sdk/python`, the Python package `qupai-lab`) is a library for scripts: it calls InstruCore's REST
-routes, through QuPai's sandbox door with a lab project's key or at the lab PC with a local key, and holds no
-secret of its own.
+routes, through QuPai's sandbox door with a lab project's key, at QuPai's gateway (`/rest/<listing>/`) with the
+person's own `qupai` sign-in on a lab they may work directly (through a lab workstation's local door there), or at
+the lab PC with a local key, and holds no secret of its own. Which labs a person may work directly is the
+platform's answer (`GET /v1/me/lab-access`); the gateway checks it at every call.
 
 ## Release boundary
 
