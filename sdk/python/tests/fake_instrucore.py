@@ -87,6 +87,7 @@ class FakeInstruCore:
         self.direct_keys: set[str] = set()  # keys of people who work the lab directly
         self.holders: dict[str, str] = {}  # machine → the key that started its session
         self.ended: dict[str, str] = {}  # machine → the key whose session someone else ended (end_by_other)
+        self.queues: dict[str, list[dict[str, Any]]] = {}  # machine → the requests waiting for it, as its queue lists them
         self.before: dict[tuple[str, str], Callable[[], None]] = {}  # called as that request arrives
         self.moku_refusal: str | None = None  # set: every Moku call is refused with it, in the Moku's envelope
         # set to a role: the Moku's answers list their writes (instrucore.writes, InstruCore 0.26.2) as made on the
@@ -167,7 +168,7 @@ class FakeInstruCore:
             "state": "in_session" if session else "free",
             "session": session,
             "offer": None,
-            "queue": [],
+            "queue": list(self.queues.get(mid, [])),
             "settings": {"max_s": 1800, "offer_s": 300},
             "instruments": [
                 {"role": r, "instrument": i, "class": "function_generator" if r.startswith("dg") else "oscilloscope",

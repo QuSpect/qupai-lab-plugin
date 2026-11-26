@@ -78,6 +78,20 @@ with lab.machine(sys.argv[1]) as m:
             print("carried on", e, flush=True)
 """
 
+PUT_BACK = """\
+import sys
+from qupai_lab import Lab
+
+lab = Lab.from_env(record="calls.jsonl")
+with lab.machine(sys.argv[1]) as m:
+    gen = m.role("dg822_pro_usb")
+    gen.write("set_output", channel=1, on=True)
+    try:
+        gen.write("set_output", channel=1, on=True)
+    finally:
+        gen.write("set_output", channel=1, on=False)  # the script's own clean-up
+"""
+
 SWALLOWED = """\
 import sys
 from qupai_lab import Lab
@@ -349,10 +363,33 @@ def test_a_run_whose_session_was_ended_stops_and_fails_saying_why(live: FakeInst
     manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
     assert (manifest["status"], manifest["exit_code"]) == ("failed", 1)
     assert "was ended by someone other than this run (from the bench page, or by the lab's admin)" in manifest["error"]
-    assert manifest["session_ended"] and manifest["machines"][0]["ended"] == manifest["error"]
-    assert manifest["error"] in err
+    reason = manifest["machines"][0]["ended"]
+    assert manifest["session_ended"] and manifest["error"].startswith(reason + " Still set on signal-bench")
+    assert manifest["restore"]["left_set"] == [{"role": "dg822_pro_usb", "op": "set_output",
+                                                "args": {"channel": 1, "on": True}}]  # what its first write left
+    assert reason in err and manifest["error"][len(reason) + 1:] in err
     assert _answer(out) == {"run": run_id, "status": "failed", "exit_code": 1, "error": manifest["error"]}
     assert ("held", 0) in points(out) and "session_ended" in [k for k, _ in points(out)]
+
+
+def test_a_run_whose_session_was_ended_puts_back_what_its_clean_up_can(
+    live: FakeInstruCore, tmp_path: Path, run_id: str, monkeypatch: pytest.MonkeyPatch, capfd
+) -> None:
+    place, sha = make_place(tmp_path, PUT_BACK)
+    rel = key_file(place, run_id, live.url)
+    monkeypatch.chdir(place)
+    _ended_at_the_second_write(live)
+    assert main(argv(rel, sha)) == 1
+    out, _ = capfd.readouterr()
+    writes = [s.body for s in live.calls("POST", "/v1/instruments/dg822_pro_usb/write/set_output")]
+    assert writes == [{"channel": 1, "on": True}, {"channel": 1, "on": True}, {"channel": 1, "on": False}]
+    assert [s.body["reason"] for s in live.calls("POST", "/v1/machines/bench/sessions/end")] == [
+        "qupai-lab: the run's settings are put back"]
+    manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
+    assert (manifest["status"], manifest["exit_code"]) == ("failed", 1)
+    assert manifest["restore"]["left_set"] == [] and manifest["restore"]["session"]
+    assert "Its clean-up put back 1 setting on signal-bench in session" in manifest["error"]
+    assert _answer(out)["error"] == manifest["error"]  # the run's job says it
 
 
 def test_a_script_that_swallows_the_end_still_fails(live: FakeInstruCore, tmp_path: Path, run_id: str,
