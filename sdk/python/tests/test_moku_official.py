@@ -175,3 +175,31 @@ def test_a_lab_that_lists_no_writes_is_noted(door: FakeInstruCore, tmp_path: Pat
     assert out["changes"] == []
     assert out["official_sdk"][0]["writes_listed"] is False
     assert capsys.readouterr().err.count("lists no writes") == 1
+
+
+def test_a_runs_session_ended_under_the_package_stops_the_run(door: FakeInstruCore, tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """The member ends the run's session while the package works the Moku: the lab refuses its next call in the
+    Moku's envelope, and the run stops in the script's main thread, whatever the package raised."""
+    from qupai_lab import RunSessionEnded
+
+    monkeypatch.setenv("QUPAI_LAB_RUN", "job_9")
+    monkeypatch.setenv("QUPAI_LAB_RUN_MACHINE", "signal-bench")
+    door.run_keys.add("qrk_run_9")
+    lab = Lab(door.url, "qrk_run_9", record=tmp_path / "calls.jsonl", script_ref="")
+    carried_on = []
+    with pytest.raises(RunSessionEnded) as e:
+        with lab.machine("signal-bench") as m:
+            with instruments.Oscilloscope(**m.moku(DEVICE)) as osc:
+                osc.get_data()
+                door.end_by_other("bench")
+                for _ in range(3):
+                    try:
+                        osc.get_data()
+                    except Exception:  # noqa: BLE001 - a script that carries on past the package's errors
+                        carried_on.append(1)
+    assert "was ended by someone other than this run" in e.value.message
+    assert carried_on  # the package raised its own for the refused call, and refused the rest at the stand-in
+    assert door.calls("POST", "/v1/machines/bench/sessions/end") == []
+    refused = [s for s in door.seen if s.path.endswith("/get_data")]
+    assert len(refused) == 2  # the refused one reached the lab; nothing after it did

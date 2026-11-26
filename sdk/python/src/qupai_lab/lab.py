@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,7 +27,7 @@ from qupai_lab import direct as _direct
 from qupai_lab import changes as _changes
 from qupai_lab.moku_forward import Forwarder
 from qupai_lab import runs as _runs
-from qupai_lab.errors import LabError, from_response
+from qupai_lab.errors import LabError, RunSessionEnded, from_response
 from qupai_lab.record import Recorder, dumps, ensure_parent, now_iso
 
 RETRIES_429 = 5
@@ -38,7 +39,15 @@ POLL_S = 2.0
 # offer is kept for minutes (InstruCore's offer_s, 300 s by default), so POLL_MAX_S still starts it in time.
 POLL_MAX_S = 15.0
 CALLS_EVERY_S = 5.0  # inside a run, the ``calls`` point at most this often
+# After the lab refused a call of the official moku package because the run's session ended, how long the package
+# has to read that answer before the script is stopped in its main thread: stopping it while the package is still
+# reading leaves its connection half used, and its own exit then fails over that instead.
+STOP_AFTER_S = 0.5
 _GONE = ("cancelled", "expired")  # a queue request that ended this way is never offered
+# A refusal that says the caller does not hold the machine (any more): no session of its own there, or someone
+# else's. Inside a live run, while the block holds the run's machine, it means the run's session ended.
+_NOT_HOLDING = ("BENCH_NOT_HELD", "SESSION_REQUIRED", "BENCH_HELD", "MACHINE_IN_SESSION")
+_SLACK_S = 5.0  # how close to a session's longest time or idle limit its end is taken to be the lab's
 # A machine's and a Moku's id as InstruCore writes ids (``moku_pro``) and public ids (``moku-bench-sim-1``): they go
 # into the official moku package's address unescaped, so they may not carry a ``/``, a ``.`` or anything else that
 # changes the route.
@@ -105,6 +114,22 @@ def _say(text: str) -> None:
     print(f"qupai-lab: {text}", file=sys.stderr, flush=True)
 
 
+def _parse_time(value: Any) -> datetime | None:
+    """An ISO 8601 time as InstruCore writes it (``2026-11-26T05:25:19.123Z``), or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        when = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _utc(when: datetime) -> str:
+    """``2026-11-26 05:25:19 UTC``: a time as a sentence says it."""
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 class _Answer:
     def __init__(self, status: int, data: Any, headers: Any) -> None:
         self.status = status
@@ -164,6 +189,10 @@ class Lab:
         self._official_used: list[dict[str, Any]] = []
         # Inside a live run (``qupai-lab run``): its id, and the live machine ``machine()`` holds for it.
         self.run_id, self.run_machine = config.run()
+        # The run's session ended while the script ran, not by the script: every later call raises it again.
+        self._ended: RunSessionEnded | None = None
+        self._ending = threading.Lock()
+        self._active_at = time.monotonic()  # the last call's answer (the lab's idle limit counts from it)
         self._calls = 0
         self._calls_told = 0
         self._calls_at = float("-inf")
@@ -301,6 +330,13 @@ class Lab:
     def _is_run_machine(self, m: dict[str, Any]) -> bool:
         return bool(self.run_machine) and self.run_machine in (m.get("id"), m.get("public_id"))
 
+    def check_running(self) -> None:
+        """Raises ``RunSessionEnded`` once the run's session ended while the script ran (``Machine``): the run
+        stops, and nothing more reaches the lab through this Lab."""
+        ended = self._ended
+        if ended is not None:
+            raise RunSessionEnded(ended.message, ended.detail)
+
     # ---- HTTP ----
 
     def _headers(self, body: bool) -> dict[str, str]:
@@ -340,7 +376,12 @@ class Lab:
         """What the local forwarder of a manufacturer's SDK (``m.moku``) does with each JSON answer of the lab: the
         Moku's envelope lists the writes the lab made (``instrucore.writes``: instrument, op and arguments, as it
         matches a run's permission), and each is kept for ``changes`` under its role on ``m``. A lab whose answers
-        list none (InstruCore before 0.26.2) is said once, and ``changes`` notes it: its writes are not there."""
+        list none (InstruCore before 0.26.2) is said once, and ``changes`` notes it: its writes are not there.
+
+        Inside a live run a refusal that says the run does not hold its machine any more (``_NOT_HOLDING``) is
+        looked into as for this SDK's own calls (``Machine._lost``): when the run's session ended, the stand-in refuses
+        every later call itself, and ``STOP_AFTER_S`` later the script is stopped in its main thread
+        (``stop.interrupt``), as by a signal, unless its block ended first (with ``RunSessionEnded``)."""
         roles = {iid: role for role, iid in reversed(list(m.roles.items()))}
         machine = m.public_id or m.target
         said = False
@@ -353,7 +394,18 @@ class Lab:
                 body = json.loads(content)
             except ValueError:
                 return
-            if not isinstance(body, dict) or body.get("success") is not True:
+            if not isinstance(body, dict):
+                return
+            self._active_at = time.monotonic()
+            if body.get("success") is False and body.get("code") in _NOT_HOLDING:
+                messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+                ended = m._lost(str(body["code"]), str(messages[0]) if messages else "")
+                if ended is not None:  # once the package has read the refusal, the script stops
+                    timer = threading.Timer(STOP_AFTER_S, stop.interrupt, (ended,))
+                    timer.daemon = True
+                    timer.start()
+                return
+            if body.get("success") is not True:
                 return
             listed = body.get("instrucore")
             if not isinstance(listed, dict) or not isinstance(listed.get("writes"), list):
@@ -426,7 +478,10 @@ class Lab:
         note: dict[str, Any] | None = None,
         record: bool = True,
         unwrap: bool = False,
+        force: bool = False,
     ) -> _Answer:
+        if not force:  # ``force``: a session's end, which a run that stopped still sends for another machine
+            self.check_running()
         line = self._line(method, path, body, note)
         if record:
             self._ran()
@@ -434,6 +489,7 @@ class Lab:
         while True:
             try:
                 answer = self._send(method, path, body)
+                self._active_at = time.monotonic()
                 break
             except LabError as e:
                 headers = getattr(e, "_headers", None)
@@ -538,6 +594,13 @@ class Lab:
         return out
 
 
+def _seconds(value: Any) -> float | None:
+    """A positive number of seconds from an answer, or None."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
 def roles_of(m: dict[str, Any]) -> dict[str, str]:
     """role → instrument id of a machine as ``GET /v1/machines`` lists it (``roles``, else ``instruments``)."""
     if isinstance(m.get("roles"), dict) and m["roles"]:
@@ -587,6 +650,12 @@ class Machine:
         self._as_run = False  # the live machine is held for the live run this script is
         self._before: str | None = None  # a lab worked directly: the live machine's session when the block began
         self._forwarders: dict[str, Forwarder] = {}  # m.moku(): one local stand-in per Moku device
+        # The session held: since when (as the lab says, and on this clock), its longest time and idle limit.
+        self._held_since: datetime | None = None
+        self._held_at = 0.0
+        self._max_s: float | None = None
+        self._idle_s: float | None = None
+        self._ended: RunSessionEnded | None = None  # the run's session ended while this block held it
 
     def __repr__(self) -> str:
         return f"Machine({self.public_id or self.target!r}, kind={self.kind!r}, held={self.held})"
@@ -641,6 +710,11 @@ class Machine:
                 forwarder.close()
             self._forwarders.clear()
             self.lab.recorder.flush()
+        # The run's session ended while the block ran: the block never ends as if it had run (a script that caught
+        # what a call raised, or the moku package's own exception, leaves it with the reason).
+        lost = self._ended
+        if lost is not None and not isinstance(exc, RunSessionEnded):
+            raise RunSessionEnded(lost.message, lost.detail) from exc
 
     def release(self, *, reason: str = "qupai-lab: released", quiet: bool = False) -> dict[str, Any] | None:
         """Ends the held session (``sessions/end``); a copy is reset for the next user. A session that already
@@ -653,14 +727,13 @@ class Machine:
         if getattr(self, "taken", False):
             whose = "the run used its member's own session" if self._as_run else "it was your session before the block"
             _say(f"{self.public_id or self.id} stays held: {whose}")
-            if self.lab.run_id:
-                metric.emit("held", 0)
+            self._tell_held(False)
             return None
         try:
             with stop.shielded():  # a signal now waits until the session has ended
-                return self.lab.request(
-                    "POST", f"/v1/machines/{_seg(self.id)}/sessions/end", {"reason": reason[:256]}
-                )
+                return self.lab._request(
+                    "POST", f"/v1/machines/{_seg(self.id)}/sessions/end", {"reason": reason[:256]}, force=True
+                ).data
         except LabError as e:
             if e.code == "NOT_FOUND":
                 _say(f"the session on {self.public_id or self.id} had already ended")
@@ -672,7 +745,7 @@ class Machine:
         finally:
             if self.lab.run_id:
                 self.lab._tell_calls()
-                metric.emit("held", 0)
+            self._tell_held(False)
 
     def renew(self) -> dict[str, Any]:
         """Restarts the held session's time limit, unless someone waits for the machine (``QUEUE_WAITING``).
@@ -775,13 +848,89 @@ class Machine:
                 # theirs, and stays held when the block ends.
                 if self._before and self.session.get("session_id") == self._before:
                     self.taken = True
-                if self.lab.run_id:
-                    metric.emit("held", 1)
+                self._held_at = time.monotonic()
+                self._held_since = _parse_time(self.session.get("started_at"))
+                self._max_s = _seconds(self.session.get("max_expires_in_s"))
+                self._idle_s = _seconds(self.session.get("idle_expires_in_s"))
+                self._tell_held(True)
         return answer
 
+    # ---- a live run's points: its own machine only ----
+
     def _tell_position(self, position: Any) -> None:
-        if self.lab.run_id and isinstance(position, int) and not isinstance(position, bool):
+        if self.lab.run_id and self._as_run and isinstance(position, int) and not isinstance(position, bool):
             metric.emit("queue_position", position)
+
+    def _tell_held(self, held: bool) -> None:
+        """``held`` 1 and ``held_since`` (the session's start, in seconds since the epoch) when the run's session
+        starts, ``held`` 0 when it ends. Only the run's own machine: a copy a run's script holds is not the run."""
+        if not (self.lab.run_id and self._as_run):
+            return
+        if held:
+            since = self._held_since or datetime.now(timezone.utc)
+            metric.emit("held", 1)
+            metric.emit("held_since", round(since.timestamp(), 3))
+        else:
+            metric.emit("held", 0)
+
+    # ---- the run's session, ended while it runs ----
+
+    def _lost(self, code: str, message: str = "") -> RunSessionEnded | None:
+        """A call on this machine was refused with ``code``. Inside a live run, while the block holds the run's
+        machine, a refusal that says the run does not hold it (``_NOT_HOLDING``) is looked into: when the machine's
+        session is no longer the run's, the run stops. Its manifest says why (``error``), ``held`` 0 and
+        ``session_ended`` are told, the reason is said on stderr, and the ``RunSessionEnded`` to raise is answered;
+        None when the run still holds the machine or this is not the run's machine. The block's end then ends
+        nothing: the session is not the run's to end."""
+        if not (self.lab.run_id and self._as_run and self.held) or code not in _NOT_HOLDING:
+            return None
+        lab = self.lab
+        with lab._ending:
+            if lab._ended is not None:
+                return RunSessionEnded(lab._ended.message, lab._ended.detail)
+            if not self.held:
+                return None
+            idle = time.monotonic() - lab._active_at
+            try:
+                now = lab._request("GET", f"/v1/machines/{_seg(self.id)}", record=False).data
+            except LabError:
+                now = None  # the lab said the run does not hold it: that stands
+            session = now.get("session") if isinstance(now, dict) else None
+            mine = (self.session or {}).get("session_id")
+            if isinstance(session, dict) and mine and session.get("session_id") == mine:
+                return None  # still the run's: the refusal was about something else
+            reason = self._ended_reason(code, idle, session if isinstance(session, dict) else None)
+            detail = {"machine": self.public_id or self.id, "session": mine, "refused": {"code": code,
+                      "message": message}, "held_since": _utc(self._held_since) if self._held_since else None}
+            self.held = False
+            lab._ended = self._ended = RunSessionEnded(reason, detail)
+            if self._entry is not None and lab.run_folder is not None:
+                lab.run_folder.session_ended(self._entry, reason)
+            lab._tell_calls()
+            self._tell_held(False)
+            metric.emit("session_ended", round(time.time(), 3))
+            _say(reason)
+            return RunSessionEnded(reason, detail)
+
+    def _ended_reason(self, code: str, idle_s: float, holder: dict[str, Any] | None) -> str:
+        """Why the run's session ended, as far as the run can tell: the lab ended it at the session's longest time
+        or after its idle limit, else someone other than the run ended it."""
+        name = self.public_id or self.id
+        since = f", held since {_utc(self._held_since)}" if self._held_since else ""
+        held_for = time.monotonic() - self._held_at
+        if self._max_s and held_for >= self._max_s - _SLACK_S:
+            cause = f"reached its longest time ({self._max_s / 60:g} minutes) and the lab ended it"
+        elif self._idle_s and idle_s >= self._idle_s - _SLACK_S:
+            cause = f"was ended by the lab after {self._idle_s:g} s without a call (its idle limit)"
+        else:
+            cause = "was ended by someone other than this run (from the bench page, or by the lab's admin)"
+        now = ""
+        if holder is not None:
+            who = holder.get("client_name") or "someone outside your organization"
+            started = _parse_time(holder.get("started_at"))
+            now = f"; {who} holds {name} now" + (f" (since {_utc(started)})" if started else "")
+        return (f"The run's session on {name}{since}, {cause}; the lab refused the run's next call at "
+                f"{_utc(datetime.now(timezone.utc))} ({code}){now}. The run stops.")
 
     def _say_queued(self, data: dict[str, Any], request: dict[str, Any], live: bool) -> None:
         detail = ((data or {}).get("error") or {}).get("detail") or {}
@@ -839,7 +988,8 @@ class Machine:
         forwarder = self._forwarders.get(device_id)
         if forwarder is None:
             forwarder = Forwarder(target, self.lab._official_headers("moku", version),
-                                  self.lab._official_answer(self, device_id), opener=self.lab._open)
+                                  self.lab._official_answer(self, device_id), opener=self.lab._open,
+                                  refuse=lambda: self.lab._ended.message if self.lab._ended is not None else None)
             self._forwarders[device_id] = forwarder
         self.lab._official("moku", version, self, device_id)
         # moku 4.4 manages bitstreams unless this is set (its manage_bitstreams argument is gone); the lab uploads
@@ -873,10 +1023,21 @@ class Instrument:
     def _call(self, kind: str, op: str, args: dict[str, Any], unwrap: bool) -> Any:
         note = {"machine": self.machine.public_id, "role": self.role, "instrument": self.id, "kind": kind, "op": op}
         path = f"/v1/instruments/{_seg(self.id)}/{kind}/{_seg(op)}"
+        lab = self.machine.lab
+        lab.check_running()
+        counted = False
         try:
-            return self.machine.lab.request("POST", path, args, note=note, unwrap=unwrap)
+            return lab.request("POST", path, args, note=note, unwrap=unwrap)
+        except LabError as e:
+            lab._called()  # a refused call counts too, and is told with the run's end
+            counted = True
+            ended = self.machine._lost(e.code, e.message)
+            if ended is not None:
+                raise ended from e
+            raise
         finally:
-            self.machine.lab._called()
+            if not counted:
+                lab._called()
 
     def read(self, op: str, **args: Any) -> Any:
         """Calls the read op ``op`` and answers its result. Anyone may read."""

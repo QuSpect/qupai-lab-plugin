@@ -17,7 +17,10 @@ QuPai starts it in the place's repository after the member approved the run, wit
    manifest the approved commit, the exit code and the status (``ended``, ``failed``, ``stopped``), and for a script
    that did not end well the last lines it wrote to stderr (``error``), writing a short one when the script left
    none; rewrites ``experiments/INDEX.md``; and removes the checkout;
-5. exits with the script's exit code (128 + the signal's number when a signal ended it).
+5. prints the run's answer as the last line of its stdout, one JSON object (``answer``): ``run``, ``status``,
+   ``exit_code`` and ``error`` (why it did not end well, or null), which QuPai's Runtime hands the run's job as its
+   output; and exits with the script's exit code (128 + the signal's number when a signal ended it, 1 when the
+   script exited 0 although the run's session ended while it ran).
 
 SIGTERM and SIGINT are passed to the script, which ends its held session and exits; after 20 s it is killed. What it
 left is still copied and the checkout removed. A run that cannot start exits with 2.
@@ -31,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import json
 import tempfile
 import threading
 import time
@@ -58,6 +62,16 @@ class RunError(Exception):
 
 def _say(text: str) -> None:
     print(f"qupai-lab: {text}", file=sys.stderr, flush=True)
+
+
+def answer(run_id: str | None, status: str, exit_code: int, error: str | None) -> None:
+    """The run's answer, the last line of this command's stdout: what QuPai's Runtime reports as its job's output."""
+    line = json.dumps({"run": run_id, "status": status, "exit_code": exit_code, "error": error}, ensure_ascii=False)
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def run_root() -> Path:
@@ -292,18 +306,22 @@ def _wait(proc: subprocess.Popen[bytes], signals: _Signals) -> int:
 def run(key_file: str, commit: str, experiment: str, machine: str) -> int:
     signals = _Signals()
     signals.install()
+    started: dict[str, str] = {}
     try:
-        return _run(Path(key_file), commit, experiment, machine, signals)
+        return _run(Path(key_file), commit, experiment, machine, signals, started)
     except (RunError, OSError) as e:
         _say(f"run: {e}")
+        answer(started.get("run"), "failed", CANNOT_START, f"the run could not start: {e}")
         return CANNOT_START
     finally:
         signals.restore()
 
 
-def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _Signals) -> int:
+def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _Signals,
+         started: dict[str, str]) -> int:
     settings = read_key_file(key_file)
     run_id, run_machine = settings[config.RUN_ENV], settings[config.RUN_MACHINE_ENV]
+    started["run"] = run_id
     if run_machine != machine:
         raise RunError(f"the run {run_id} is on {run_machine}, not {machine}")
     folder_rel = experiment_path(experiment)
@@ -318,6 +336,8 @@ def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _S
         for name in OUTPUTS:  # the commit's own (a rehearsal's) are not this run's
             _remove(folder / name)
         if signals.signum is not None:
+            answer(run_id, "stopped", 128 + signals.signum, f"stopped by {signal.Signals(signals.signum).name} "
+                   "before the script started")
             return 128 + signals.signum
         _say(f"run {run_id}: {folder_rel.as_posix()}/run.py at {sha[:7]} on {machine}")
         output = _Output(tree.with_name(tree.name + ".output.log"))
@@ -331,6 +351,7 @@ def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _S
         output.follow(proc.stdout, _sink(sys.stdout), stderr=False)
         output.follow(proc.stderr, _sink(sys.stderr), stderr=True)
         code: int | None = None
+        final: dict[str, Any] | None = None
         try:
             signals.started(proc)
             code = _wait(proc, signals)
@@ -354,20 +375,28 @@ def _run(key_file: Path, commit: str, experiment: str, machine: str, signals: _S
             finally:
                 output.log.unlink(missing_ok=True)
             if kept is not None:
+                left = _runs.read_manifest(dest) or {}
+                if code == 0 and left.get("session_ended"):
+                    _say(f"run {run_id}: the run's session ended while the script ran; the run failed (exit 1)")
+                    code = 1
                 try:
-                    _runs.finish_live(dest, run_id=run_id, experiment=folder_rel.as_posix(), commit=sha,
-                                      machine=machine, exit_code=code, stopped=signals.signum is not None,
-                                      error=output.error() if code != 0 else None)
+                    final = _runs.finish_live(dest, run_id=run_id, experiment=folder_rel.as_posix(), commit=sha,
+                                              machine=machine, exit_code=code, stopped=signals.signum is not None,
+                                              error=output.error() if code != 0 else None)
                     experiments = _runs.index_folder(repo / folder_rel)
                     if experiments is not None:
                         _runs.write_index(experiments)
                 except OSError as e:
                     _say(f"run {run_id}: could not write its manifest or the index: {e}")
         if kept is None:
+            answer(run_id, "failed", code or 1, f"its outputs could not be copied to {dest}")
             return code or 1
         where = f"{folder_rel.as_posix()}/runs/{run_id}/"
         _say(f"run {run_id}: the script exited with {code}; "
              + (f"kept {', '.join(kept)} in {where}" if kept else f"it left no output; its manifest is in {where}"))
+        status = str((final or {}).get("status") or ("ended" if code == 0 else "failed"))
+        error = (final or {}).get("error") if code != 0 else None
+        answer(run_id, status, code, error if isinstance(error, str) and error else None)
         return code
     finally:
         _remove_worktree(repo, tree)

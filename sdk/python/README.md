@@ -110,6 +110,7 @@ the key's member holds a role on; another bench answers `NOT_FOUND`.
 | `lab.save(path, value, **meta)` | Writes `value` as JSON (folders made as needed); answers `{"file": path, **meta}` |
 | `lab.table(path, rows)` | Writes a list of dicts as CSV; answers `{"file": path, "rows": n}` |
 | `lab.changes(path)` | Writes the writes made through this `Lab` as JSON (below) and answers it |
+| `declare_changes(experiment, changes)` | Writes `<experiment>/changes.json` with a live run's changes declared, not rehearsed: for a lab with no simulated copy ([below](#declaring-a-live-runs-changes-without-a-rehearsal)) |
 | `lab.input(name)` | `inputs/<name>` of the experiment: parsed when it is `.json`, else its text |
 | `lab.out`, `lab.experiment`, `lab.inputs` | This run's folder, the experiment's folder, its `inputs/` (paths) |
 | `lab.request(method, path, body)` | Any other InstruCore route, with the same headers, record and errors |
@@ -120,8 +121,8 @@ Each execution of an experiment's script has its own **run folder**, `<experimen
 its job; a rehearsal's is the UTC time it started and four random hex digits (`20261122-021116-a3f9`), so the
 folders sort by time. `Lab.from_env()` makes it for a script run as `python run.py …`, at the script's first call
 or output, and a relative path given to `record`, `lab.save`, `lab.table` or `lab.changes` is inside it. The
-experiment's own folder keeps only what a person writes, and the latest rehearsal's `changes.json`, which a live
-run's card reads:
+experiment's own folder keeps only what a person writes, and the latest rehearsal's `changes.json` (or the
+[declared](#declaring-a-live-runs-changes-without-a-rehearsal) one), which a live run's card reads:
 
 ```
 experiments/
@@ -131,7 +132,7 @@ experiments/
     ├── run.py                        the steps: python run.py <machine>
     ├── analysis.py                   tables and figures of one run: python analysis.py runs/<id>
     ├── inputs/sweep.json             the values run.py reads (lab.input)
-    ├── changes.json                  the latest rehearsal's changes: the live run's card
+    ├── changes.json                  the latest rehearsal's changes, or declared ones: the live run's card
     └── runs/
         ├── 20261122-021116-a3f9/     a rehearsal, on a simulated copy
         │   ├── manifest.json
@@ -168,7 +169,7 @@ only when given (`run_folder=`).
 | --- | --- |
 | A simulated pool (`signal-bench-sim`) | A free copy is held for the block. When none is free the block waits in the pool's queue, asking again when a copy is offered; `wait_s` gives up and leaves the queue. The copy is released at the block's end, also when the block raises, and reset for the next user |
 | One simulated copy (`signal-bench-sim-2`) | That copy, the same way |
-| The run's live machine, inside a [live run](#live-runs) (`QUPAI_LAB_RUN_MACHINE`, by id or public id) | Held for the block: `POST sessions` with `{"purpose": "run <run id>", "queue": true}`. While others hold or wait for it, the block waits in the machine's queue and asks again when it is offered; the lab holds it for the run's longest time. Released at the block's end, as a copy is |
+| The run's live machine, inside a [live run](#live-runs) (`QUPAI_LAB_RUN_MACHINE`, by id or public id) | Held for the block: `POST sessions` with `{"purpose": "run <run id>", "queue": true}`. While others hold or wait for it, the block waits in the machine's queue and asks again when it is offered; the lab holds it for the run's longest time. Released at the block's end, as a copy is. A session that ends while the block runs, not by the run, stops the run ([below](#when-the-runs-session-ends-while-it-runs)) |
 | Any other live machine (`signal-bench`) | Nothing is held. The member holds a live machine, in the conversation; the lab answers a script's session there with `RUN_REQUIRED` and a write the member did not allow with `APPROVAL_REQUIRED` |
 | A live machine of a lab worked directly ([`Lab.from_qupai`](#outside-qupai-with-your-own-sign-in)) | Held for the block as your own session: `POST sessions` with `{"purpose": <the block's purpose, else the script>, "queue": true}`, waiting in the machine's queue while others hold it. Your role on the bench decides (operate holds it; view is `FORBIDDEN`), and the lab's limits hold. A session you already held when the block began (`start_session` in `qupai mcp`, say) is used and stays held at the block's end |
 
@@ -275,6 +276,35 @@ With a run folder the answer starts with `run`, the run's id; a rehearsal also w
 gets `official_sdk` after `machines` (the devices, as in the manifest), and the writes the lab listed for those calls
 are among the changes ([above](#a-moku-with-the-official-sdk)).
 
+### Declaring a live run's changes without a rehearsal
+
+A lab whose machine has no simulated copy has nothing to rehearse on, so no rehearsal writes `changes.json`, and the
+card of a live run there would list no change: the lab then refuses the run's first write (`APPROVAL_REQUIRED`).
+Declare the writes the run will make instead, in the form the card reads, and commit the file with the experiment:
+
+```python
+from qupai_lab import declare_changes
+
+declare_changes("experiments/2026-11-26-coil-scan", [
+    # one argument moves: quantity, min and max; the arguments it keeps are fixed
+    {"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0.0, "max": 1.5, "fixed": {"channel": 1}},
+    # several move: ranges, each [min, max]
+    {"role": "scope", "op": "set_timebase", "ranges": {"scale_s": [5e-6, 5e-3], "offset_s": [0.0, 1e-3]}},
+    # nothing moves: exactly these arguments, as often as the run needs, for the whole session
+    {"role": "moku", "op": "vendor.begin_control", "fixed": {}},
+])
+```
+
+It writes `<experiment>/changes.json` as `{"declared": true, "written_at": …, "changes": […]}` and answers it. `role`
+is the instrument's role on the machine (`qupai-lab machines`), `op` the write op's name (`describe`, or the
+`instrucore.writes` the lab lists for a Moku's calls). A change the card would not take raises `LabError`
+`INVALID_CHANGE` saying which and why (an unknown key such as `args`, a range with min above max, an argument both
+moving and fixed, more than 32 changes), and nothing is written. The card reads a declared file as a rehearsed one:
+each change with the lab's answer for it (`grants/evaluate`), marked `declared` and not `rehearsed`, and in the run the
+lab allows exactly these writes and refuses any other. A later rehearsal's `lab.changes()` replaces the file, and so
+does a later declaration. Declare only what the script writes, no wider than it needs: the member approves the card
+as it reads.
+
 Every request sends `Authorization: Bearer <key>` and `X-InstruCore-Script: <script>@<commit>`: the running
 script's path in its git repository and the short commit, so the lab's record shows the code behind each call.
 Outside a git repository the header is left out; `Lab(…, script_ref="…")` sets it, `script_ref=""` sends none.
@@ -302,14 +332,39 @@ qupai-lab run --key-file .qupai/runs/<run>/key.env --commit <sha> experiments/20
 4. When the script ends it copies the run folder, and any `data/`, `figures/`, `calls.jsonl` and `changes.json`
    the script wrote beside `run.py` itself, to `<experiment>/runs/<run>/` in the repository. The manifest gets
    the approved commit, the exit code and the status from it, and for a script that did not end well the last
-   lines of its stderr as `error` (a short manifest is written when the script left none),
-   `experiments/INDEX.md` is written again, and the checkout is removed, also when the script failed.
-5. It exits with the script's exit code (128 + the signal's number when a signal ended the script).
+   lines of its stderr as `error` unless the SDK said why already (a short manifest is written when the script left
+   none), `experiments/INDEX.md` is written again, and the checkout is removed, also when the script failed.
+5. It prints the run's answer as the last line of its stdout, one JSON object, which QuPai's Runtime hands the run's
+   job as its output: `{"run": "<run>", "status": "ended" | "failed" | "stopped", "exit_code": n, "error": "…" | null}`
+   (`error`: why it did not end well). It exits with the script's exit code (128 + the signal's number when a signal
+   ended the script; 1 when the script exited 0 although the run's session ended while it ran).
 
 SIGTERM and SIGINT are passed to the script, which releases the machine and exits; a script that has not ended
 20 s later is killed. What it left is still copied and the checkout removed. A run that cannot start (a key file
 without the four settings, another machine, no repository, no such commit, no `run.py` in the experiment at that
-commit) says why on stderr and exits with 2, after deleting the key file.
+commit) says why on stderr and in its answer (`"error": "the run could not start: …"`) and exits with 2, after
+deleting the key file.
+
+### When the run's session ends while it runs
+
+The run's session is the run's while its block runs, and only the lab ends it early: someone who may end it (the
+member from the bench page, the lab's admin), or the lab itself at the run's longest time or after the session's idle
+limit. The lab then refuses the run's next write, and every call of the official `moku` package, with `BENCH_NOT_HELD`
+(`SESSION_REQUIRED` on a copy, `BENCH_HELD` or `MACHINE_IN_SESSION` once another holds it). Inside a run the SDK looks
+at the machine on such a refusal, and when the session there is no longer the run's, the run stops at once:
+
+- It says why on stderr, in a sentence the manifest keeps as `error` (and the machine as `ended`, the run as
+  `session_ended`): the machine, since when the run held it, what ended it as far as the run can tell (its longest
+  time, its idle limit, or someone other than the run: the bench page or the lab's admin), when the lab refused, and
+  who holds the machine now when someone does.
+- It tells QuPai `held` 0 and `session_ended` (below), and raises `RunSessionEnded`, a `SystemExit` with exit status 1,
+  so `except Exception` (or `except LabError`) does not catch it; from the `moku` package's calls, it is raised in the
+  script's main thread as a signal is. Every later call through the same `Lab` raises it again without reaching the
+  lab, and the `moku` stand-in refuses every later call (`SESSION_ENDED`) but handing the Moku back.
+- The block's end ends nothing: the session is not the run's to end. The manifest's `status` is `failed`, and
+  `qupai-lab run` fails the run (exit 1) even when the script caught the exception and exited 0.
+
+A refusal while the session there is still the run's is the lab's own, raised as `LabError` as always.
 
 ### Points for QuPai (`QUPAI_METRIC`)
 
@@ -319,6 +374,7 @@ a background job's output, one point each:
 ```
 QUPAI_METRIC {"key": "queue_position", "value": 2}
 QUPAI_METRIC {"key": "held", "value": 1}
+QUPAI_METRIC {"key": "held_since", "value": 1795670719.0}
 QUPAI_METRIC {"key": "calls", "value": 14}
 QUPAI_METRIC {"key": "held", "value": 0}
 ```
@@ -326,10 +382,13 @@ QUPAI_METRIC {"key": "held", "value": 0}
 | Key | When |
 | --- | --- |
 | `queue_position` | The request's position in the machine's queue, when it is queued and each time it moves |
-| `held` | 1 when the session starts, 0 when it is released |
-| `calls` | The instrument calls made so far (reads, writes and checks, refused ones too), at most every 5 s, and when the session is released and the script exits |
+| `held` | 1 when the run's session starts, 0 when it is released or ended while the run ran |
+| `held_since` | With `held` 1: when the session started, as the lab says (`started_at`), in seconds since the epoch |
+| `calls` | The instrument calls made so far (reads, writes and checks, refused ones too), at most every 5 s, and when the session is released or ended and the script exits |
+| `session_ended` | When the run learned that its session ended while it ran, not by the run (seconds since the epoch; [above](#when-the-runs-session-ends-while-it-runs)) |
 
-Outside a run nothing is printed on stdout.
+They are the run's own machine's: a simulated copy the run's script holds tells nothing. Outside a run nothing is
+printed on stdout but the runner's answer.
 
 ## Errors
 
@@ -343,12 +402,14 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `LIMIT_EXCEEDED`, `POLICY_DENIED`, `FORBIDDEN` | The lab refuses this value or op. Save what you have and report the limit; never retry with another value or through another op |
 | `APPROVAL_REQUIRED` | A write on a live machine the member has not allowed |
 | `RUN_REQUIRED` | A script asked to hold a live machine: only a run the member approved holds one |
-| `SESSION_REQUIRED`, `MACHINE_IN_SESSION` | The write needs your session on that machine, or someone else holds it |
+| `SESSION_REQUIRED`, `BENCH_NOT_HELD`, `MACHINE_IN_SESSION`, `BENCH_HELD` | The write needs your session on that machine, or someone else holds it. Inside a run, on the run's machine, they mean the run's session ended: `RunSessionEnded` (below) |
+| `SESSION_ENDED` (`RunSessionEnded`, a `SystemExit`) | Inside a live run: the run's session ended while it ran, not by the run; the run stops ([above](#when-the-runs-session-ends-while-it-runs)) |
 | `INVALID_KEY`, `FORBIDDEN`, `RATE`, `UNAVAILABLE` (the gateway's) | The key, your role on the lab, too many calls, the lab not reachable through QuPai |
 | `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |
 | `INVALID_MACHINE`, `INVALID_DEVICE`, `INVALID_URL` | `m.moku()`'s own: not a plain machine or device id; the lab's address is not http(s)://host[:port][/path] |
+| `INVALID_CHANGE` | `declare_changes`'s own: a change the card would not take |
 | `NOT_SIGNED_IN`, `NO_DIRECT_ACCESS`, `NOT_OFFERED` | `Lab.from_qupai`'s own: no `qupai` sign-in with a personal key here (run `qupai login`); a lab you may not work directly from here (the message names the labs you may; ask the lab's agent for the others); a platform that does not say which labs yet (`GET /v1/me/lab-access` answered 404) |
 
 ## Tests

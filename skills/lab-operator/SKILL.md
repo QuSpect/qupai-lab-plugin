@@ -52,14 +52,23 @@ QuPai, `Lab.from_qupai("<lab id>")` finds the lab with the user's own `qupai` si
 staff granted them or the lab workstation they sit at (there, through the workstation's door). Rehearse the script
 on a simulated copy first when the lab has one. `with lab.machine("<bench>") as m:` holds the machine only for the
 block and ends the session when the block ends, also when it raises; tell the user before running it on a real
-machine, as for any real write. The SDK's README (`sdk/python/README.md` in this plugin's repository) has the rest.
+machine, as for any real write. In a QuPai lab project a live run's card lists what the rehearsal wrote
+(`changes.json`); on a lab with no simulated copy nothing can be rehearsed, so declare the run's writes with
+`declare_changes(experiment, [...])` (role, op, fixed, and quantity/min/max or ranges) and commit them: the card shows
+them as declared, not rehearsed, and the lab refuses any other write in the run. The SDK's README
+(`sdk/python/README.md` in this plugin's repository) has the rest.
+
+**A live run holds its bench as its own session.** A session whose purpose is `run <id>` is a live run a member
+approved in QuPai, running on that bench now: not someone's forgotten session, and not a run still waiting. Never end
+it (`end_session` on it, with configure) and never tell the user to release it from the bench page: that stops the
+run, which then fails. Wait for the bench, or tell the user they can cancel the run in QuPai.
 
 ## When a call is refused
 
 | Error | What it means |
 | --- | --- |
 | `SESSION_REQUIRED`, `BENCH_NOT_HELD` | Start a session on that machine first |
-| `BENCH_HELD`, `MACHINE_IN_SESSION` | Someone else holds it; reads still work. Offer to join the queue |
+| `BENCH_HELD`, `MACHINE_IN_SESSION` | Someone else holds it; reads still work. Offer to join the queue. A holder's purpose `run <id>` is a live run running there: never end it |
 | `QUEUE_WAITING`, `SESSION_PENDING` | You are in the queue; it says where |
 | `FORBIDDEN` with `required` | The user's role on that bench, or the lab's setting for outside agents, does not allow it. Tell the user |
 | `NOT_FOUND` for a machine | No such bench, or one the user holds no role on. Check `machines` |

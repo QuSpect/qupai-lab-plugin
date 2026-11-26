@@ -1,5 +1,25 @@
 # Changelog: the Lab SDK (`qupai-lab`)
 
+## 0.6.0
+
+- A live run tells QuPai `held_since` (when its session started, as the lab says) with `held` 1, so the run's job
+  says it holds the bench since then. `held` and `queue_position` are the run's own machine's only: a simulated copy
+  the run's script holds no longer toggles them.
+- A live run whose session ended while it ran, not by the run (the member released it from the bench page on
+  2026-11-26 while the run wrote; the run carried on into refusals), now stops at once. On the lab's refusal
+  (`BENCH_NOT_HELD`, `SESSION_REQUIRED`, `BENCH_HELD`, `MACHINE_IN_SESSION`, also for the `moku` package's calls)
+  the SDK looks at the machine, and when the session is no longer the run's it says why (its longest time, its idle
+  limit, or someone other than the run; when the lab refused; who holds it now), keeps that as the manifest's `error`,
+  tells QuPai `held` 0 and `session_ended`, and raises `RunSessionEnded` (a `SystemExit`, exit status 1, in the main
+  thread for the `moku` package's calls). Later calls raise it again without reaching the lab; the block's end ends
+  nothing. `qupai-lab run` fails such a run even when the script caught it and exited 0.
+- `qupai-lab run` prints the run's answer as its last line, `{"run", "status", "exit_code", "error"}`, which QuPai's
+  Runtime hands the run's job as its output: the job then says why a run failed or could not start.
+- `declare_changes(experiment, changes)` writes `<experiment>/changes.json` with a live run's changes declared
+  rather than rehearsed (`"declared": true`), checked against what the card takes (`INVALID_CHANGE`): for a lab with no
+  simulated copy, whose run's card was empty and whose first write the lab refused (`APPROVAL_REQUIRED`, Magnetic,
+  2026-11-26).
+
 ## 0.5.0
 
 - `Lab.from_qupai("magnetic")` works a lab outside QuPai with the person's own `qupai` sign-in, with no `.env`

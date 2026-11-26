@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from conftest import lines
 from fake_instrucore import FakeInstruCore
-from test_live_run import points
+from test_live_run import SINCE, points
 
 from qupai_lab import runner
 from qupai_lab.cli import main
@@ -62,6 +62,34 @@ lab = Lab.from_env(record="calls.jsonl")
 with lab.machine(sys.argv[1]) as m:
     m.role("dg822_pro_usb").write("set_output", channel=1, on=True)
     time.sleep(60)
+"""
+
+ENDED = """\
+import sys
+from qupai_lab import Lab
+
+lab = Lab.from_env(record="calls.jsonl")
+with lab.machine(sys.argv[1]) as m:
+    gen = m.role("dg822_pro_usb")
+    for on in (True, False, True):
+        try:
+            gen.write("set_output", channel=1, on=on)
+        except Exception as e:  # a script that carries on past a refusal
+            print("carried on", e, flush=True)
+"""
+
+SWALLOWED = """\
+import sys
+from qupai_lab import Lab
+
+lab = Lab.from_env(record="calls.jsonl")
+try:
+    with lab.machine(sys.argv[1]) as m:
+        m.role("dg822_pro_usb").write("set_output", channel=1, on=True)
+        m.role("dg822_pro_usb").write("set_output", channel=1, on=False)
+except BaseException:
+    pass
+sys.exit(0)
 """
 
 DEAF = """\
@@ -174,7 +202,7 @@ def test_run_end_to_end(live: FakeInstruCore, tmp_path: Path, run_id: str, monke
     assert live.sessions == {}
 
     out, err = capfd.readouterr()
-    assert points(out) == [("held", 1), ("calls", 1), ("held", 0)]
+    assert points(out) == [("held", 1), ("held_since", SINCE), ("calls", 1), ("held", 0)]
     assert f"run {run_id}: {EXPERIMENT}/run.py at {sha[:7]} on signal-bench" in err
     assert (f"run {run_id}: the script exited with 3; kept calls.jsonl, changes.json, data/, figures/, output.log in "
             f"{EXPERIMENT}/runs/{run_id}/") in err
@@ -220,7 +248,11 @@ def test_a_run_that_cannot_start(live: FakeInstruCore, tmp_path: Path, run_id: s
             "signal-bench"]
     assert main(args) == runner.CANNOT_START
     assert not (place / rel).exists()  # deleted also when the run cannot start
-    assert says in capfd.readouterr().err
+    out, err = capfd.readouterr()
+    assert says in err
+    answer = json.loads(out.strip().splitlines()[-1])  # the run's answer says why, for its job
+    assert (answer["status"], answer["exit_code"]) == ("failed", 2) and says in answer["error"]
+    assert answer["error"].startswith("the run could not start: ")
     assert live.calls("POST") == [] and not (place / EXPERIMENT / "runs").exists()
     assert git(place, "worktree", "list", "--porcelain").count("worktree ") == 1
 
@@ -286,3 +318,62 @@ def test_a_script_that_does_not_stop_is_killed_after_the_grace(fake: FakeInstruC
     manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
     assert {k: manifest[k] for k in ("run", "kind", "commit", "status", "exit_code", "outputs")} == {
         "run": run_id, "kind": "live", "commit": sha, "status": "stopped", "exit_code": 137, "outputs": ["data/started", "output.log"]}
+
+
+def _ended_at_the_second_write(live: FakeInstruCore) -> None:
+    writes = []
+
+    def second() -> None:
+        writes.append(1)
+        if len(writes) == 2:
+            live.end_by_other("bench")  # the member released it from the bench page
+
+    live.before[("POST", "/v1/instruments/dg822_pro_usb/write/set_output")] = second
+
+
+def _answer(out: str) -> dict:
+    last = out.strip().splitlines()[-1]
+    return json.loads(last)
+
+
+def test_a_run_whose_session_was_ended_stops_and_fails_saying_why(live: FakeInstruCore, tmp_path: Path, run_id: str,
+                                                                  monkeypatch: pytest.MonkeyPatch, capfd) -> None:
+    place, sha = make_place(tmp_path, ENDED)
+    rel = key_file(place, run_id, live.url)
+    monkeypatch.chdir(place)
+    _ended_at_the_second_write(live)
+    assert main(argv(rel, sha)) == 1
+    out, err = capfd.readouterr()
+    assert "carried on" not in out  # it stopped at once
+    assert len(live.calls("POST", "/v1/instruments/")) == 2 and live.calls("POST", "/v1/machines/bench/sessions/end") == []
+    manifest = json.loads((place / EXPERIMENT / "runs" / run_id / "manifest.json").read_text())
+    assert (manifest["status"], manifest["exit_code"]) == ("failed", 1)
+    assert "was ended by someone other than this run (from the bench page, or by the lab's admin)" in manifest["error"]
+    assert manifest["session_ended"] and manifest["machines"][0]["ended"] == manifest["error"]
+    assert manifest["error"] in err
+    assert _answer(out) == {"run": run_id, "status": "failed", "exit_code": 1, "error": manifest["error"]}
+    assert ("held", 0) in points(out) and "session_ended" in [k for k, _ in points(out)]
+
+
+def test_a_script_that_swallows_the_end_still_fails(live: FakeInstruCore, tmp_path: Path, run_id: str,
+                                                    monkeypatch: pytest.MonkeyPatch, capfd) -> None:
+    place, sha = make_place(tmp_path, SWALLOWED)
+    rel = key_file(place, run_id, live.url)
+    monkeypatch.chdir(place)
+    _ended_at_the_second_write(live)
+    assert main(argv(rel, sha)) == 1  # the script exited 0
+    out, err = capfd.readouterr()
+    assert "the run's session ended while the script ran; the run failed (exit 1)" in err
+    answer = _answer(out)
+    assert (answer["status"], answer["exit_code"]) == ("failed", 1) and "ended by someone other" in answer["error"]
+
+
+def test_the_runs_answer_is_its_last_line(live: FakeInstruCore, tmp_path: Path, run_id: str,
+                                           monkeypatch: pytest.MonkeyPatch, capfd) -> None:
+    place, sha = make_place(tmp_path, RECORDING)
+    rel = key_file(place, run_id, live.url)
+    monkeypatch.chdir(place)
+    assert main(argv(rel, sha)) == 3
+    answer = _answer(capfd.readouterr().out)
+    assert answer["run"] == run_id and (answer["status"], answer["exit_code"]) == ("failed", 3)
+    assert answer["error"] is None  # it wrote nothing to stderr

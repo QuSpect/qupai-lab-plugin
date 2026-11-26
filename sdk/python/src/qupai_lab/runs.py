@@ -251,6 +251,18 @@ class RunFolder:
             self.manifest["machines"][index]["released_at"] = now_iso()
             self.save()
 
+    def session_ended(self, index: int, reason: str) -> None:
+        """A live run's session on a machine ended while the script ran, not by the script: the machine's
+        ``released_at`` and ``ended`` (why), the run's ``session_ended`` (when) and ``error``. The run failed."""
+        if self.manifest is None:
+            return
+        at = now_iso()
+        if 0 <= index < len(self.manifest["machines"]):
+            self.manifest["machines"][index].update(released_at=at, ended=reason)
+        self.manifest["session_ended"] = at
+        self.manifest["error"] = reason
+        self.save()
+
     def finish(self, status: str, calls: int) -> None:
         """The script ended: its status, its calls and the files it left. Nothing when it never ran a call."""
         if self.manifest is None:
@@ -260,15 +272,26 @@ class RunFolder:
         self.save()
 
     def ending(self, calls: int, stopped: bool) -> None:
-        """At the interpreter's exit: failed after an uncaught exception, stopped by a signal, else ended."""
-        self.finish("failed" if _uncaught else "stopped" if stopped else "ended", calls)
+        """At the interpreter's exit: failed after an uncaught exception or when the run's session ended while it
+        ran, stopped by a signal, else ended."""
+        lost = self.manifest is not None and bool(self.manifest.get("session_ended"))
+        self.finish("failed" if _uncaught or lost else "stopped" if stopped else "ended", calls)
+
+
+def read_manifest(folder: Path) -> dict[str, Any] | None:
+    """The manifest in ``folder``, or None when there is none (or it is not a JSON object)."""
+    try:
+        manifest = json.loads((folder / MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
 
 
 def finish_live(dest: Path, *, run_id: str, experiment: str, commit: str, machine: str, exit_code: int,
-                stopped: bool, error: str | None = None) -> None:
+                stopped: bool, error: str | None = None) -> dict[str, Any]:
     """``qupai-lab run`` after a live run's script: the manifest the script left in ``dest`` (or a short one when it
     left none) gets the approved commit, the exit code and its status from it; a script that did not end well, the
-    last lines of its stderr (``error``)."""
+    last lines of its stderr (``error``), unless the SDK already said why (the run's session ended). Answers it."""
     path = dest / MANIFEST
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -285,10 +308,11 @@ def finish_live(dest: Path, *, run_id: str, experiment: str, commit: str, machin
                     status="ended" if exit_code == 0 else "stopped" if stopped or exit_code in STOPPED_CODES
                     else "failed")
     manifest["ended_at"] = manifest.get("ended_at") or now_iso()
-    if error:
+    if error and not manifest.get("error"):
         manifest["error"] = error
     manifest["outputs"], manifest["raw_files"] = _files(dest)
     _write_json(path, manifest)
+    return manifest
 
 
 # ---- the experiments' index ----

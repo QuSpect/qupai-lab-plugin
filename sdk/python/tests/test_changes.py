@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fake_instrucore import FakeInstruCore
 
 from qupai_lab import Lab
@@ -80,3 +81,71 @@ def test_the_running_scripts_blob_is_gits(tmp_path) -> None:
     got = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=True).stdout.strip()
     want = subprocess.run(["git", "hash-object", str(script)], capture_output=True, text=True, check=True).stdout.strip()
     assert got == want
+
+
+# ---- declared changes: a live run on a lab with no simulated copy ----
+
+DECLARED = [
+    {"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0.0, "max": 1.5, "fixed": {"channel": 1}},
+    {"role": "moku", "op": "vendor.begin_control"},
+    {"role": "scope", "op": "set_timebase", "ranges": {"scale_s": [5e-6, 5e-3], "offset_s": [0, 1e-3]}, "fixed": {}},
+]
+
+
+def test_declared_changes_are_the_cards_changes_json(tmp_path: Path) -> None:
+    from qupai_lab import declare_changes
+
+    folder = tmp_path / "experiments" / "2026-11-26-coil"
+    folder.mkdir(parents=True)
+    out = declare_changes(folder, DECLARED)
+    assert out["declared"] is True and out["written_at"].endswith("Z")
+    assert out["changes"] == [
+        {"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0.0, "max": 1.5, "fixed": {"channel": 1}},
+        {"role": "moku", "op": "vendor.begin_control", "fixed": {}},
+        {"role": "scope", "op": "set_timebase", "ranges": {"scale_s": [5e-6, 5e-3], "offset_s": [0, 1e-3]},
+         "fixed": {}},
+    ]
+    assert json.loads((folder / "changes.json").read_text()) == out
+    # the same shape a rehearsal writes: role, op, fixed, and quantity/min/max or ranges
+    rehearsed = group([w("coil", "set_current", channel=1, current_a=a) for a in (0.0, 1.5)])[0]
+    assert set(out["changes"][0]) == set(rehearsed) - {"calls"}
+
+
+@pytest.mark.parametrize(
+    ("change", "says"),
+    [
+        ({"role": "coil", "op": "set_current", "args": {"channel": 1}}, "unknown args; the arguments it keeps go in fixed"),
+        ({"role": "", "op": "set_current"}, "role is the instrument's role"),
+        ({"role": "coil", "op": "set current"}, "op is the write op's name"),
+        ({"role": "coil", "op": "set_current", "quantity": "current_a", "min": 2, "max": 1}, "min <= max"),
+        ({"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0}, "min and max"),
+        ({"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0, "max": float("inf")}, "finite"),
+        ({"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0, "max": 1, "ranges": {"x": [0, 1]}},
+         "not both"),
+        ({"role": "coil", "op": "set_current", "quantity": "current_a", "min": 0, "max": 1,
+          "fixed": {"current_a": 1}}, "current_a both moves and is fixed"),
+        ({"role": "scope", "op": "set_timebase", "ranges": {"scale_s": [1]}}, "ranges.scale_s is [min, max]"),
+        ({"role": "coil", "op": "set_current", "fixed": [1]}, "fixed is an object"),
+        ({"role": "coil", "op": "set_current", "calls": -1}, "calls is a whole number"),
+        ("coil.set_current", "a change is an object"),
+    ],
+)
+def test_a_declared_change_the_card_would_not_take_is_refused(tmp_path: Path, change: object, says: str) -> None:
+    from qupai_lab import LabError, declare_changes
+
+    with pytest.raises(LabError) as e:
+        declare_changes(tmp_path, [change])
+    assert e.value.code == "INVALID_CHANGE" and says in e.value.message
+    assert not (tmp_path / "changes.json").exists()
+
+
+def test_declaring_needs_the_experiment_and_at_most_the_cards_changes(tmp_path: Path) -> None:
+    from qupai_lab import LabError, declare_changes
+
+    with pytest.raises(LabError) as e:
+        declare_changes(tmp_path / "nowhere", DECLARED)
+    assert e.value.code == "NOT_FOUND"
+    with pytest.raises(LabError) as e:
+        declare_changes(tmp_path, [{"role": "coil", "op": f"op_{i}"} for i in range(33)])
+    assert e.value.code == "INVALID_CHANGE" and "at most 32 changes" in e.value.message
+    assert declare_changes(tmp_path, [])["changes"] == []  # a run that writes nothing
