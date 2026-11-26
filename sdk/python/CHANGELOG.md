@@ -1,5 +1,25 @@
 # Changelog: the Lab SDK (`qupai-lab`)
 
+## 0.6.1
+
+- A live run whose session ended under it (the member released the bench from the bench page, or the lab ended it
+  after its idle limit) puts back what its clean-up can. A call on the run's machine that the script makes while it
+  stops (in a `finally`, an `except` or a `with` block's exit, as `RunSessionEnded` or its own error goes by) goes
+  through a session the run takes for that, `{"purpose": "run <id>: putting back its settings", "queue": false,
+  "max_s": 120}`, once and only while the machine's block is open, the machine is free, nobody waits for it and the
+  run's longest time is not over; the block's end ends it. The lab checks the run's key and its card as in the run.
+  Otherwise the call reaches nothing and raises `LabError` `NOT_PUT_BACK` saying why (who holds the machine now,
+  someone waiting, the run's longest time, the block already ended), so the script's own `except LabError` goes on
+  with the rest of its clean-up. A script that swallows the end and carries on outside a handler still reaches
+  nothing (`RunSessionEnded`, as in 0.6.0). On Magnetic, 2026-11-26, a run's `finally` could not put the Moku's input
+  back (`BENCH_NOT_HELD`) and left it on DC / 400 mVpp, twice.
+- The manifest's `restore` says what became of the run's settings: the `session` taken to put them back (or
+  `why_not`), each change of the clean-up after the end (`after_end`, with `put_back` and, when it did not reach the
+  instrument, `why`; the official `moku` package's calls the stand-in refused that would have changed something are
+  listed too), and `left_set`, what the run set on the machine and did not put back (the last write of each setting,
+  by role, op and the argument that says which: `channel`, `slot`, `output`, …). Its `error`, and so the run's answer
+  and job, adds a sentence on each: what was put back, what did not reach the machine and why, and what is still set.
+
 ## 0.6.0
 
 - A live run tells QuPai `held_since` (when its session started, as the lab says) with `held` 1, so the run's job

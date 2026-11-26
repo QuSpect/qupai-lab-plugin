@@ -28,6 +28,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,7 @@ class RunFolder:
         self.argv = list(argv or [])
         self.lab = lab_name(lab_url)
         self.manifest: dict[str, Any] | None = None
+        self._saving = threading.Lock()  # a Moku's stand-in notes refusals from its own thread
         _note_uncaught()
 
     def resolve(self, path: str | os.PathLike[str]) -> Path:
@@ -219,7 +221,8 @@ class RunFolder:
 
     def save(self) -> None:
         if self.manifest is not None:
-            _write_json(self.path / MANIFEST, self.manifest)
+            with self._saving:
+                _write_json(self.path / MANIFEST, self.manifest)
 
     def held(self, *, requested: str, machine: str | None, kind: str | None, session: str | None,
              held: bool) -> int:
@@ -261,6 +264,24 @@ class RunFolder:
             self.manifest["machines"][index].update(released_at=at, ended=reason)
         self.manifest["session_ended"] = at
         self.manifest["error"] = reason
+        self.save()
+
+    def restore(self, value: dict[str, Any]) -> None:
+        """A live run whose session ended under it: what became of its settings (``restore``): the ``machine``, the
+        ``session`` it took to put them back (or null) and ``why_not`` when it could take none, each change its
+        clean-up made after the end (``after_end``: ``put_back`` true when it reached the instrument, else ``why``),
+        and ``left_set``, what the run set and did not put back (the last write of each setting)."""
+        if self.manifest is None:
+            return
+        self.manifest["restore"] = value
+        self.save()
+
+    def ended_error(self, message: str) -> None:
+        """The run's ``error`` once its block ended after its session did: the reason and what became of its
+        settings."""
+        if self.manifest is None:
+            return
+        self.manifest["error"] = message
         self.save()
 
     def finish(self, status: str, calls: int) -> None:

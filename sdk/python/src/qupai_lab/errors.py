@@ -29,9 +29,12 @@ class RunSessionEnded(SystemExit):
     """Inside a live run: the session the run held on its machine ended while the script ran, and not by the run
     (someone ended it from the bench page or as the lab's admin, or the lab ended it at the run's longest time or
     after its idle limit). The run stops: this is a ``SystemExit`` (exit status 1), so ``except Exception`` does not
-    catch it, and every later call through the same ``Lab`` raises it again without reaching the lab. ``message``
-    says what happened, ``detail`` the machine, the session and the lab's refusal; ``code`` is the exit status, and
-    ``error_code`` is ``SESSION_ENDED``."""
+    catch it, and every later call through the same ``Lab`` raises it again without reaching the lab, but the
+    script's clean-up as it stops (a ``finally``, an ``except``, a ``with`` block's exit), which puts back what it can
+    in a session of the run's own and raises ``LabError`` ``NOT_PUT_BACK`` for the rest (0.6.1). ``message`` says
+    what happened and, once the machine's block ended, what was put back and what is still set; ``detail`` the
+    machine, the session and the lab's refusal; ``code`` is the exit status, and ``error_code`` is
+    ``SESSION_ENDED``."""
 
     error_code = "SESSION_ENDED"
 

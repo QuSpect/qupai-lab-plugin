@@ -34,7 +34,11 @@ def test_a_run_whose_session_someone_else_ended_stops_at_its_next_write(
     assert ended.code == 1 and ended.error_code == "SESSION_ENDED"
     assert "The run's session on signal-bench, held since 2026-11-21 10:00:00 UTC, was ended by someone other than " \
            "this run (from the bench page, or by the lab's admin)" in ended.message
-    assert "(BENCH_NOT_HELD)" in ended.message and ended.message.endswith("The run stops.")
+    assert "(BENCH_NOT_HELD)" in ended.message and "The run stops." in ended.message
+    # What the run set and did not put back (its script made no clean-up call after the end).
+    assert ended.message.endswith("Still set on signal-bench by this run, as far as it knows: set_output of "
+                                  "dg822_pro_usb (channel 1) (the manifest's restore.left_set): check them before the "
+                                  "next run.")
     assert ended.detail["refused"]["code"] == "BENCH_NOT_HELD" and ended.detail["machine"] == "signal-bench"
     assert not m.held
     # Its block's end ended nothing: the session was not the run's to end any more.
@@ -43,7 +47,8 @@ def test_a_run_whose_session_someone_else_ended_stops_at_its_next_write(
     found = points(out.out)
     assert found[:-1] == [("held", 1), ("held_since", SINCE), ("calls", 1), ("calls", 2), ("held", 0)]
     assert found[-1][0] == "session_ended" and abs(found[-1][1] - time.time()) < 60
-    assert ended.message in out.err
+    reason, _, left = ended.message.partition(" Still set")
+    assert reason in out.err and "Still set" + left in out.err
 
 
 def test_nothing_more_reaches_the_lab_once_the_run_stopped(

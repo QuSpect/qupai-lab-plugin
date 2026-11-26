@@ -149,7 +149,8 @@ blob id), `lab` (the listing, from a sandbox door's or the gateway's REST door's
 a manufacturer's own package, [`m.moku()`](#a-moku-with-the-official-sdk): `package`, `version`, `machine`, `device`;
 the lab records those calls), `started_at`, `ended_at`, `status`
 (`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` and `error` (a live
-run's; `error` is the end of its stderr when it did not end well),
+run's; `error` is the end of its stderr when it did not end well), `session_ended` and `restore` (a live run whose
+session ended under it: [below](#when-the-runs-session-ends-while-it-runs)),
 `calls`, `outputs` (the files the run itself left, the raw ones counted in `raw_files`; an analysis adds its own
 later) and `versions`.
 
@@ -366,6 +367,31 @@ at the machine on such a refusal, and when the session there is no longer the ru
 
 A refusal while the session there is still the run's is the lab's own, raised as `LabError` as always.
 
+**Putting the run's settings back** (0.6.1). A script that changes a setting puts it back in a `finally` inside the
+machine's block. When the session ended under the run, a call on the run's machine that the script makes while it
+stops (in a `finally`, an `except` or a `with` block's exit, as `RunSessionEnded` or the script's own error goes by)
+is its clean-up, and the SDK lets it through a session the run takes for it, once, when:
+
+- the machine's block is still open (a clean-up after the block finds it ended),
+- the session did not end at the run's longest time (the run's approved time is over then),
+- and the machine is free and nobody waits for it (`GET /v1/machines/<id>`: no `session`, an empty `queue`).
+
+That session is `{"purpose": "run <id>: putting back its settings", "queue": false, "max_s": 120}` (the lab gives the
+smaller of that and its own limits), the lab checks the run's key and its approved changes in it as in the run, and the
+block's end ends it. Otherwise each such call reaches nothing and raises `LabError` `NOT_PUT_BACK`, saying why, so the
+script's `except LabError` goes on with the rest of its clean-up. A call outside a handler still raises
+`RunSessionEnded` without reaching the lab: a script that swallows the end and carries on with its scan takes nothing.
+The official `moku` package's calls after the end are refused by its stand-in as before: put a Moku's settings back
+with the lab's own ops (`m.role(...).write(...)`).
+
+The manifest's `restore` says what became of the run's settings: `machine`, `session` (the one taken to put them back,
+or null) and `why_not` (why none could be taken), `after_end` (each change of the clean-up after the end: its `role`,
+`op` and `args`, `put_back`, and `why` when it did not reach the instrument; for the `moku` package, its `device` and
+`call`), and `left_set`, what the run set on the machine and did not put back: the last write of each setting (by role,
+op and the argument that says which: `channel`, `slot`, `output`, `port`, `axis`, `index`, `input`, `source`). The
+`error` adds what was put back, what did not reach the machine and why, and what is still set, so the run's answer and
+its job say it too.
+
 ### Points for QuPai (`QUPAI_METRIC`)
 
 Inside a run (`QUPAI_LAB_RUN` set) the SDK prints the run's progress on stdout as lines QuPai's Runtime takes from
@@ -404,6 +430,7 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `RUN_REQUIRED` | A script asked to hold a live machine: only a run the member approved holds one |
 | `SESSION_REQUIRED`, `BENCH_NOT_HELD`, `MACHINE_IN_SESSION`, `BENCH_HELD` | The write needs your session on that machine, or someone else holds it. Inside a run, on the run's machine, they mean the run's session ended: `RunSessionEnded` (below) |
 | `SESSION_ENDED` (`RunSessionEnded`, a `SystemExit`) | Inside a live run: the run's session ended while it ran, not by the run; the run stops ([above](#when-the-runs-session-ends-while-it-runs)) |
+| `NOT_PUT_BACK` | Inside a live run whose session ended: a call of the script's clean-up that could not be put through a session of the run's own, and why; the manifest's `restore` lists it ([above](#when-the-runs-session-ends-while-it-runs)) |
 | `INVALID_KEY`, `FORBIDDEN`, `RATE`, `UNAVAILABLE` (the gateway's) | The key, your role on the lab, too many calls, the lab not reachable through QuPai |
 | `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |

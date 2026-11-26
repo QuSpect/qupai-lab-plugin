@@ -8,7 +8,8 @@ session, while 4.4's fast transport keeps only the host and port of ``ip`` and s
 
 Each JSON answer is also handed to ``on_answer`` (the Lab keeps the writes the lab lists in it for ``changes``).
 Once ``refuse`` answers a sentence (a live run whose session ended), nothing more is passed on: each call is refused
-here with it (``SESSION_ENDED``), and handing the Moku back succeeds, since there is nothing to hand back.
+here with it (``SESSION_ENDED``) and told to ``refused`` (the run's manifest lists what did not reach the Moku),
+and handing the Moku back succeeds, since there is nothing to hand back.
 Standard library only, as the rest of the Lab SDK.
 """
 
@@ -42,11 +43,13 @@ class Forwarder:
     ``target`` (``<lab>/v1/moku/<machine>/<device>``)."""
 
     def __init__(self, target: str, headers: dict[str, str], on_answer: Callable[[int, str, bytes], None],
-                 opener: Callable[..., Any] | None = None, refuse: Callable[[], str | None] | None = None) -> None:
+                 opener: Callable[..., Any] | None = None, refuse: Callable[[], str | None] | None = None,
+                 refused: Callable[[str, str], None] | None = None) -> None:
         self.target = target.rstrip("/")
         self.headers = dict(headers)
         self.on_answer = on_answer
         self.refuse = refuse or (lambda: None)
+        self.refused = refused or (lambda method, path: None)  # told each call refused here (method, path)
         # How a call goes to the lab: the Lab's own way (straight, or through a lab workstation's door).
         self._open = opener or urllib.request.urlopen
         forwarder = self
@@ -100,6 +103,10 @@ class Forwarder:
                 done = json.dumps({"success": True, "data": "Ownership relinquished", "code": None, "messages": []})
                 self._reply(h, 200, "application/json", done.encode(), {})
             else:
+                try:
+                    self.refused(method, h.path)
+                except Exception:  # noqa: BLE001 - noting a refusal never breaks the answer
+                    pass
                 self._reply(h, 200, "application/json", _envelope("SESSION_ENDED", stopped), {})
             return
         headers = {k: h.headers[k] for k in PASSED_ON if h.headers.get(k)}

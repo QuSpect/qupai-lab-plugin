@@ -48,6 +48,12 @@ _GONE = ("cancelled", "expired")  # a queue request that ended this way is never
 # else's. Inside a live run, while the block holds the run's machine, it means the run's session ended.
 _NOT_HOLDING = ("BENCH_NOT_HELD", "SESSION_REQUIRED", "BENCH_HELD", "MACHINE_IN_SESSION")
 _SLACK_S = 5.0  # how close to a session's longest time or idle limit its end is taken to be the lab's
+# After a run's session ended under it, the longest a session the run takes to put its settings back may last (the lab
+# gives the smaller of this and its own limits); the SDK ends it at the block's end.
+PUT_BACK_MAX_S = 120.0
+# Arguments that say which of an instrument's settings a write sets (CH1 and CH4 are two settings, not one).
+_WHICH = ("channel", "ch", "slot", "output", "port", "axis", "index", "input", "source")
+_LISTED = 8  # settings a sentence names before "and N more"
 # A machine's and a Moku's id as InstruCore writes ids (``moku_pro``) and public ids (``moku-bench-sim-1``): they go
 # into the official moku package's address unescaped, so they may not carry a ``/``, a ``.`` or anything else that
 # changes the route.
@@ -128,6 +134,29 @@ def _parse_time(value: Any) -> datetime | None:
 def _utc(when: datetime) -> str:
     """``2026-11-26 05:25:19 UTC``: a time as a sentence says it."""
     return when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _cleaning_up() -> bool:
+    """The script is handling an exception right now: in an ``except`` or ``finally`` clause as one goes by, or a
+    ``with`` block's exit. That is where a stopping script puts back what it changed."""
+    return sys.exc_info()[1] is not None
+
+
+def _which(args: dict[str, Any]) -> dict[str, Any]:
+    """The arguments of a write that say which setting it sets (``_WHICH``)."""
+    return {k: args[k] for k in _WHICH if k in args}
+
+
+def _setting(w: _changes.Write) -> str:
+    """A setting as a sentence names it: ``vendor.set_frontend of spectrum (channel 4)``."""
+    which = ", ".join(f"{k} {v}" for k, v in _which(w.args).items())
+    return f"{w.op} of {w.role}" + (f" ({which})" if which else "")
+
+
+def _settings(writes: list[_changes.Write]) -> str:
+    named = [_setting(w) for w in writes[:_LISTED]]
+    more = len(writes) - len(named)
+    return ", ".join(named) + (f" and {more} more" if more > 0 else "")
 
 
 class _Answer:
@@ -656,6 +685,17 @@ class Machine:
         self._max_s: float | None = None
         self._idle_s: float | None = None
         self._ended: RunSessionEnded | None = None  # the run's session ended while this block held it
+        self._ended_cause: str | None = None  # "longest", "idle" or "other" (``_ended_reason``)
+        # After the run's session ended: how many of the Lab's writes came before (what the run set), the session the
+        # run took to put its settings back (or why it could not), and each call made to put them back.
+        self._writes_before_end = 0
+        self._put_back: dict[str, Any] | None = None
+        self._put_back_asked = False
+        self._session_taken: str | None = None
+        self._put_back_why: str | None = None
+        self._after: list[dict[str, Any]] = []
+        self._put_back_writes: list[_changes.Write] = []
+        self._exited = False
 
     def __repr__(self) -> str:
         return f"Machine({self.public_id or self.target!r}, kind={self.kind!r}, held={self.held})"
@@ -704,17 +744,24 @@ class Machine:
         try:
             ended = "qupai-lab: the script's block raised" if kind else "qupai-lab: the script's block ended"
             self.release(reason=self._reason(ended), quiet=kind is not None)
+            self._end_put_back()
         finally:
+            self._exited = True
             self._unguard()
             for forwarder in self._forwarders.values():
                 forwarder.close()
             self._forwarders.clear()
             self.lab.recorder.flush()
         # The run's session ended while the block ran: the block never ends as if it had run (a script that caught
-        # what a call raised, or the moku package's own exception, leaves it with the reason).
+        # what a call raised, or the moku package's own exception, leaves it with the reason), and the reason says
+        # what was put back and what may still be set.
         lost = self._ended
-        if lost is not None and not isinstance(exc, RunSessionEnded):
-            raise RunSessionEnded(lost.message, lost.detail) from exc
+        if lost is not None:
+            message = self._restored()
+            if isinstance(exc, RunSessionEnded):
+                exc.message = message
+            else:
+                raise RunSessionEnded(message, lost.detail) from exc
 
     def release(self, *, reason: str = "qupai-lab: released", quiet: bool = False) -> dict[str, Any] | None:
         """Ends the held session (``sessions/end``); a copy is reset for the next user. A session that already
@@ -903,6 +950,7 @@ class Machine:
             detail = {"machine": self.public_id or self.id, "session": mine, "refused": {"code": code,
                       "message": message}, "held_since": _utc(self._held_since) if self._held_since else None}
             self.held = False
+            self._writes_before_end = len(lab._writes)
             lab._ended = self._ended = RunSessionEnded(reason, detail)
             if self._entry is not None and lab.run_folder is not None:
                 lab.run_folder.session_ended(self._entry, reason)
@@ -919,10 +967,13 @@ class Machine:
         since = f", held since {_utc(self._held_since)}" if self._held_since else ""
         held_for = time.monotonic() - self._held_at
         if self._max_s and held_for >= self._max_s - _SLACK_S:
+            self._ended_cause = "longest"
             cause = f"reached its longest time ({self._max_s / 60:g} minutes) and the lab ended it"
         elif self._idle_s and idle_s >= self._idle_s - _SLACK_S:
+            self._ended_cause = "idle"
             cause = f"was ended by the lab after {self._idle_s:g} s without a call (its idle limit)"
         else:
+            self._ended_cause = "other"
             cause = "was ended by someone other than this run (from the bench page, or by the lab's admin)"
         now = ""
         if holder is not None:
@@ -931,6 +982,185 @@ class Machine:
             now = f"; {who} holds {name} now" + (f" (since {_utc(started)})" if started else "")
         return (f"The run's session on {name}{since}, {cause}; the lab refused the run's next call at "
                 f"{_utc(datetime.now(timezone.utc))} ({code}){now}. The run stops.")
+
+    # ---- putting back what the run set, after its session ended ----
+
+    def _after_end(self, inst: Instrument, kind: str, op: str, args: dict[str, Any], unwrap: bool) -> Any:
+        """A call on the run's machine after its session ended, made while the script stops (``_cleaning_up``: its
+        ``finally``, an ``except``, a ``with`` block's exit): the script putting back what the run changed. It goes
+        through a session the run takes for that (``_take_back``) when the lab lets it; otherwise it reaches nothing,
+        raises ``LabError`` ``NOT_PUT_BACK`` (so the script's own ``except LabError`` sees it and its clean-up goes on)
+        and the manifest's ``restore`` lists it."""
+        lab = self.lab
+        name = self.public_id or self.id
+        session = self._take_back()
+        if session is None:
+            why = self._put_back_why or "the run's session had ended"
+            self._note_after(inst, kind, op, args, ok=False, why=why)
+            raise LabError("NOT_PUT_BACK", f"{op} of {inst.role} did not reach {name}: the run's session there had "
+                           f"ended, and {why}", {"machine": name, "role": inst.role, "op": op, "why": why})
+        note = {"machine": name, "role": inst.role, "instrument": inst.id, "kind": kind, "op": op, "put_back": True}
+        path = f"/v1/instruments/{_seg(inst.id)}/{kind}/{_seg(op)}"
+        try:
+            answer = lab._request("POST", path, args, note=note, unwrap=unwrap, force=True)
+        except LabError as e:
+            self._note_after(inst, kind, op, args, ok=False, why=f"{e.code}: {e.message}")
+            raise
+        finally:
+            lab._called()
+        self._note_after(inst, kind, op, args, ok=True)
+        return answer.data
+
+    def _take_back(self) -> dict[str, Any] | None:
+        """The session the run takes to put its settings back, once: only inside the machine's block, when the session
+        did not end at the run's longest time (its approved time is over), the machine is free and nobody waits for it.
+        The lab checks the run's key and its approved changes as in the run itself. None, with ``_put_back_why``, when
+        it cannot be taken (nor on its own: it is never queued for)."""
+        if self._put_back is not None or self._put_back_asked:
+            return self._put_back
+        self._put_back_asked = True
+        lab = self.lab
+        name = self.public_id or self.id
+        why: str | None = None
+        if self._exited:
+            why = f"the script's block on {name} had ended"
+        elif self._ended_cause == "longest":
+            why = "the run's longest time is over"
+        else:
+            try:
+                now = lab._request("GET", f"/v1/machines/{_seg(self.id)}", record=False, force=True).data
+            except LabError as e:
+                now, why = None, f"the lab did not say whether {name} is free ({e.code})"
+            holder = now.get("session") if isinstance(now, dict) else None
+            if why is None and isinstance(holder, dict):
+                why = f"{holder.get('client_name') or 'someone outside your organization'} holds {name} now"
+            elif why is None and isinstance(now, dict) and (now.get("queue") or now.get("offer")):
+                why = f"someone is waiting for {name}"  # in its queue, or offered it already
+        if why is None:
+            body = {"purpose": f"run {lab.run_id}: putting back its settings"[:256], "queue": False,
+                    "max_s": PUT_BACK_MAX_S}
+            try:
+                with stop.shielded():
+                    answer = lab._request("POST", f"/v1/machines/{_seg(self.id)}/sessions", body, force=True)
+            except LabError as e:
+                why = f"the lab gave the run no session to put them back ({e.code}: {e.message})"
+            else:
+                if answer.status == 201 and isinstance(answer.data, dict):
+                    self._put_back = answer.data
+                    self._session_taken = str(answer.data.get("session_id") or "") or None
+                else:  # queued after all: never wait here
+                    why = f"the lab would only queue the run for {name}"
+                    rid = ((answer.data or {}).get("request") or {}).get("request_id") if isinstance(
+                        answer.data, dict) else None
+                    if rid:
+                        try:
+                            lab._request("DELETE", f"/v1/session-requests/{_seg(rid)}", record=False, force=True)
+                        except LabError:
+                            pass
+        if why is not None:
+            self._put_back_why = why
+            _say(f"the run's settings on {name} cannot be put back: {why}")
+        else:
+            _say(f"putting back the run's settings on {name} in session {self._session_taken}")
+        self._keep_restore()
+        return self._put_back
+
+    def _end_put_back(self) -> None:
+        """Ends the session taken to put the run's settings back (the block's end)."""
+        session, self._put_back = self._put_back, None
+        if session is None:
+            return
+        try:
+            with stop.shielded():
+                self.lab._request("POST", f"/v1/machines/{_seg(self.id)}/sessions/end",
+                                  {"reason": "qupai-lab: the run's settings are put back"}, force=True)
+        except LabError as e:
+            if e.code != "NOT_FOUND":
+                _say(f"could not end the session {session.get('session_id')} on {self.public_id or self.id}: {e}")
+
+    def _note_after(self, inst: Instrument, kind: str, op: str, args: dict[str, Any], *, ok: bool,
+                    why: str | None = None) -> None:
+        """One call made after the run's session ended, for the manifest's ``restore``: its writes only."""
+        if kind != "write":
+            return
+        entry: dict[str, Any] = {"role": inst.role, "instrument": inst.id, "op": op, "args": dict(args),
+                                 "at": now_iso(), "put_back": ok}
+        if why:
+            entry["why"] = why
+        self._after.append(entry)
+        if ok:
+            self._put_back_writes.append(_changes.Write(inst.role, op, dict(args), self.public_id or self.target))
+        self._keep_restore()
+
+    def moku_refused(self, device: str, method: str, path: str) -> None:
+        """A call of the official moku package that the local stand-in refused after the run's session ended: one that
+        would have changed something (not a ``get_``, nor handing the Moku back) is listed as not put back."""
+        if self._ended is None:
+            return
+        operation = path.split("?", 1)[0].removeprefix("/api/").strip("/")
+        last = operation.rsplit("/", 1)[-1]
+        if method == "GET" or last.startswith("get_") or last in ("describe", "relinquish_ownership"):
+            return
+        self._after.append({"device": device, "call": f"{method} {operation}", "at": now_iso(), "put_back": False,
+                            "why": "the moku package's calls after the run's session ended are not passed on"})
+        self._keep_restore()
+
+    def _left_set(self) -> list[_changes.Write]:
+        """What the run set on this machine while it held it and did not put back: the last write of each setting
+        (role, op and the arguments that say which, ``_WHICH``), less the settings written again in a put-back."""
+        machine = self.public_id or self.target
+        last: dict[str, _changes.Write] = {}
+        for w in self.lab._writes[: self._writes_before_end]:
+            if w.machine in (machine, self.target, self.id):
+                key = json.dumps([w.role, w.op, _which(w.args)], sort_keys=True, default=str)
+                last.pop(key, None)
+                last[key] = w
+        for w in self._put_back_writes:
+            last.pop(json.dumps([w.role, w.op, _which(w.args)], sort_keys=True, default=str), None)
+        return list(last.values())
+
+    def _keep_restore(self) -> None:
+        """The manifest's ``restore``: what happened to the run's settings after its session ended."""
+        folder = self.lab.run_folder
+        if folder is None or self._ended is None:
+            return
+        folder.restore({
+            "machine": self.public_id or self.id,
+            "session": self._session_taken,
+            "why_not": self._put_back_why,
+            "after_end": list(self._after),
+            "left_set": [{"role": w.role, "op": w.op, "args": w.args} for w in self._left_set()],
+        })
+
+    def _restored(self) -> str:
+        """The block's end after the run's session ended: the reason, with what was put back and what may still be
+        set, said on stderr and kept as the manifest's ``error``."""
+        lost = self._ended
+        assert lost is not None
+        name = self.public_id or self.id
+        done = [a for a in self._after if a.get("put_back")]
+        failed = [a for a in self._after if not a.get("put_back")]
+        left = self._left_set()
+        said: list[str] = []
+        if done:
+            sid = self._session_taken
+            said.append(f"Its clean-up put back {len(done)} setting{'s' if len(done) != 1 else ''} on {name}"
+                        + (f" in session {sid}, which it then ended" if sid else "") + ".")
+        if failed:
+            why = self._put_back_why or str(failed[0].get("why") or "")
+            said.append(f"{len(failed)} change{'s' if len(failed) != 1 else ''} of its clean-up did not reach {name}"
+                        + (f" ({why})" if why else "") + ".")
+        if left:
+            said.append(f"Still set on {name} by this run, as far as it knows: {_settings(left)} (the manifest's "
+                        "restore.left_set): check them before the next run.")
+        message = " ".join([lost.message, *said])
+        if said:
+            _say(" ".join(said))
+        self._keep_restore()
+        folder = self.lab.run_folder
+        if folder is not None:
+            folder.ended_error(message)
+        return message
 
     def _say_queued(self, data: dict[str, Any], request: dict[str, Any], live: bool) -> None:
         detail = ((data or {}).get("error") or {}).get("detail") or {}
@@ -989,7 +1219,8 @@ class Machine:
         if forwarder is None:
             forwarder = Forwarder(target, self.lab._official_headers("moku", version),
                                   self.lab._official_answer(self, device_id), opener=self.lab._open,
-                                  refuse=lambda: self.lab._ended.message if self.lab._ended is not None else None)
+                                  refuse=lambda: self.lab._ended.message if self.lab._ended is not None else None,
+                                  refused=lambda method, path, d=device_id: self.moku_refused(d, method, path))
             self._forwarders[device_id] = forwarder
         self.lab._official("moku", version, self, device_id)
         # moku 4.4 manages bitstreams unless this is set (its manage_bitstreams argument is gone); the lab uploads
@@ -1023,7 +1254,13 @@ class Instrument:
     def _call(self, kind: str, op: str, args: dict[str, Any], unwrap: bool) -> Any:
         note = {"machine": self.machine.public_id, "role": self.role, "instrument": self.id, "kind": kind, "op": op}
         path = f"/v1/instruments/{_seg(self.id)}/{kind}/{_seg(op)}"
-        lab = self.machine.lab
+        m = self.machine
+        lab = m.lab
+        # A script that stops (an except, a finally, a with's exit) after the run's session ended puts back what it
+        # changed: such a call goes through a session taken for it, when the lab lets the run take one (Machine).
+        cleaning = _cleaning_up()
+        if lab._ended is not None and m._ended is not None and cleaning:
+            return m._after_end(self, kind, op, args, unwrap)
         lab.check_running()
         counted = False
         try:
@@ -1031,7 +1268,9 @@ class Instrument:
         except LabError as e:
             lab._called()  # a refused call counts too, and is told with the run's end
             counted = True
-            ended = self.machine._lost(e.code, e.message)
+            ended = m._lost(e.code, e.message)
+            if ended is not None and cleaning and m._ended is not None:
+                return m._after_end(self, kind, op, args, unwrap)
             if ended is not None:
                 raise ended from e
             raise
