@@ -1,6 +1,6 @@
 ---
 name: lab-operator
-description: Operate a QuPai lab's instruments through this plugin's lab tools (machines, describe, read, write, sweep, sessions). Use when the user asks to look at, measure with, rehearse on or control the instruments of their QuPai lab.
+description: Operate a QuPai lab's instruments through this plugin's lab tools (machines, describe, read, write, sweep, measure, sessions). Use when the user asks to look at, measure with, rehearse on or control the instruments of their QuPai lab.
 ---
 
 # Operating a QuPai lab
@@ -44,9 +44,18 @@ user's own role is.
 7. **The user can watch.** `/qupai-lab:watch` opens the lab's live page in QuPai (`/qupai-lab:watch <bench>` one
    bench), where every call shows in the activity strip, yours marked as an agent's.
 
+## Scans
+
+A scan of one parameter with reads at each point is one `measure` call where the lab offers it (InstruCore 0.42.0 and
+later): up to 1000 `values`, with `reads`, `settle_s` and `reads_per_point`. The lab checks every point against its
+limits before the first moves and keeps every reading in the session's record (the answer's `file`, its `points` with
+each point's statistics). It is a real write like any other: rehearse it on a simulated copy, and tell the user what
+it will move through before running it on a real machine. A scan longer than about 40 s answers `running` with a
+`next` call: call `measure_status` with its `scan` until it ends; `measure_stop` stops it after the step it is in.
+
 ## Scripts
 
-For a scan or any loop of many calls, a Python script with the Lab SDK (`pip install qupai-lab`) works the same lab
+For any other loop of many calls, a Python script with the Lab SDK (`pip install qupai-lab`) works the same lab
 through InstruCore's REST API, under the same roles, limits and sessions. It is not only for QuPai projects: outside
 QuPai, `Lab.from_qupai("<lab id>")` finds the lab with the user's own `qupai` sign-in (`qupai login`), for a lab QuPai
 staff granted them or the lab workstation they sit at (there, through the workstation's door). Rehearse the script
