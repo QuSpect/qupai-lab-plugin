@@ -2,7 +2,9 @@
 (src/instrucore/api/machines.py, api/instruments.py): a live bench and a pool of two simulated copies.
 
 A key in ``run_keys`` is a live run's (InstruCore 0.21.0's ``lab_run`` claim on the bench): it may start a
-session on the bench with the queue on, and write there while it holds it.
+session on the bench with the queue on, and write there while it holds it. A key in ``direct_keys`` is a person's
+who works the lab directly (a token without ``script``): it may hold the bench too, and asking again while it
+holds it answers the same session, as InstruCore does for the same caller.
 
 ``/v1/moku/<machine>/<device>/api/<group>/<operation>`` stands in for InstruCore's copy of a Moku's own HTTP API
 (the endpoint for the official moku package), on a machine the fake knows: the Moku's answers in its own envelope (``success``, ``data``,
@@ -15,6 +17,7 @@ import importlib.metadata
 
 import json
 import re
+import socketserver
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -77,6 +80,8 @@ class FakeInstruCore:
         self.start_position = 2  # a queued request's first position; each look moves it up one, to 1
         self.taken = False
         self.run_keys: set[str] = set()  # keys of live runs on the bench
+        self.direct_keys: set[str] = set()  # keys of people who work the lab directly
+        self.holders: dict[str, str] = {}  # machine → the key that started its session
         self.before: dict[tuple[str, str], Callable[[], None]] = {}  # called as that request arrives
         self.moku_refusal: str | None = None  # set: every Moku call is refused with it, in the Moku's envelope
         # set to a role: the Moku's answers list their writes (instrucore.writes, InstruCore 0.26.2) as made on the
@@ -84,6 +89,7 @@ class FakeInstruCore:
         self.moku_writes_role: str | None = None
         self.lock = threading.Lock()
         self._n = 0
+        self._unix: list[socketserver.ThreadingUnixStreamServer] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}{self.prefix}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -95,6 +101,17 @@ class FakeInstruCore:
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+        for unix in self._unix:
+            unix.shutdown()
+            unix.server_close()
+
+    def serve_unix(self, path: str) -> None:
+        """Answers on the Unix socket at ``path`` too, as a lab workstation's door passes the calls on: the same
+        lab, the same record of what came."""
+        server = socketserver.ThreadingUnixStreamServer(path, self._handler())
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self._unix.append(server)
 
     def respond(self, method: str, path: str, status: int, body: Any, **kw: Any) -> None:
         """The next ``times`` requests to ``method path`` get this answer instead of the fake's own."""
@@ -167,6 +184,7 @@ class FakeInstruCore:
         if method == "POST" and len(rest) == 4 and rest[0] == "machines" and rest[2:] == ["sessions", "end"]:
             mid = _internal(rest[1])
             s = self.sessions.pop(mid, None)
+            self.holders.pop(mid, None)
             if s is None:
                 return 404, _err("NOT_FOUND", f"机器 {mid} 上没有会话", resource="session")
             return 200, {**s, "reason": "released", "note": (body or {}).get("reason", ""), "restore": {"ok": True}}
@@ -246,9 +264,11 @@ class FakeInstruCore:
         if target == "bench":
             if body.get("simulated"):
                 return 400, _err("KIND_MISMATCH", "bench 是真机，不是仿真池或仿真副本", machine="bench", reason="live")
-            if key not in self.run_keys:
+            if key not in self.run_keys and key not in self.direct_keys:
                 return 403, _err("RUN_REQUIRED", "a live machine is held only for a run the member approved: start "
                                  "the session in the conversation", machine="bench")
+            if "bench" in self.sessions and self.holders.get("bench") == key:
+                return 201, self.sessions["bench"]
         queue = "bench" if target == "bench" else POOL
         mine = next((r for r in self.requests.values()
                      if r["queue"] == queue and r["status"] in ("pending", "offered")), None)
@@ -269,6 +289,7 @@ class FakeInstruCore:
             if "bench" in self.sessions:
                 return 409, _err("MACHINE_IN_SESSION", "bench 正在使用中", machine="bench")
             session = self._session("bench", body.get("purpose", ""))
+            self.holders["bench"] = key
             if self.taken:  # a run on the bench its member already holds takes that session
                 session["taken"] = True
             return 201, session

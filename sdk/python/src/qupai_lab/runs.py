@@ -86,9 +86,10 @@ def _git(folder: Path, *args: str) -> str | None:
 
 
 def lab_name(url: str) -> str | None:
-    """The lab's listing when ``url`` is a sandbox door's (``…/lab/<listing>``); else None (no address is kept)."""
+    """The lab's listing when ``url`` is a sandbox door's (``…/lab/<listing>``) or the gateway's REST door
+    (``…/rest/<listing>``, ``Lab.from_qupai``); else None (no address is kept)."""
     parts = [p for p in urlparse(url).path.split("/") if p]
-    return parts[-1] if len(parts) >= 2 and parts[-2] == "lab" else None
+    return parts[-1] if len(parts) >= 2 and parts[-2] in ("lab", "rest") else None
 
 
 def main_script() -> Path | None:

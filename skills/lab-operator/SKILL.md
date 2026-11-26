@@ -44,6 +44,16 @@ user's own role is.
 7. **The user can watch.** `/qupai-lab:watch` opens the lab's live page in QuPai (`/qupai-lab:watch <bench>` one
    bench), where every call shows in the activity strip, yours marked as an agent's.
 
+## Scripts
+
+For a scan or any loop of many calls, a Python script with the Lab SDK (`pip install qupai-lab`) works the same lab
+through InstruCore's REST API, under the same roles, limits and sessions. It is not only for QuPai projects: outside
+QuPai, `Lab.from_qupai("<lab id>")` finds the lab with the user's own `qupai` sign-in (`qupai login`), for a lab QuPai
+staff granted them or the lab workstation they sit at (there, through the workstation's door). Rehearse the script
+on a simulated copy first when the lab has one. `with lab.machine("<bench>") as m:` holds the machine only for the
+block and ends the session when the block ends, also when it raises; tell the user before running it on a real
+machine, as for any real write. The SDK's README (`sdk/python/README.md` in this plugin's repository) has the rest.
+
 ## When a call is refused
 
 | Error | What it means |
@@ -56,4 +66,6 @@ user's own role is.
 | `LIMIT_EXCEEDED` | Rule 4 |
 
 If the lab's tools are missing or say unauthorized, the user signs in once: `/mcp`, the server
-`plugin:qupai-lab:lab`, Authenticate. That opens QuPai's own sign-in in the browser.
+`plugin:qupai-lab:lab`, Authenticate. That opens QuPai's own sign-in in the browser. If they are still refused once
+signed in, the user may not work this lab directly from outside QuPai: that is a grant only QuPai staff make. Then
+the lab's agent is the way (`qupai ask -lab <lab> "…"`): it does the work in QuPai, with its own approvals.

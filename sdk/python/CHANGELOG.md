@@ -1,5 +1,25 @@
 # Changelog: the Lab SDK (`qupai-lab`)
 
+## 0.5.0
+
+- `Lab.from_qupai("magnetic")` works a lab outside QuPai with the person's own `qupai` sign-in, with no `.env`
+  (direct lab access, DL8). It reads the sign-in `qupai login` keeps (`QUPAI_CREDENTIALS`, else
+  `qupai/credentials.json` in the user's configuration directory: its `server` and `api_key`; the key is never
+  printed), asks the platform which labs the person may work directly from where they are
+  (`GET /v1/me/lab-access`), and speaks InstruCore's REST API at `<platform>/rest/<listing>/` with the person's key
+  (`QUPAI_GATEWAY` names another gateway). A lab not listed raises `NO_DIRECT_ACCESS`, naming the labs the person may
+  work directly and saying that asking the lab's agent is the way for the others; no sign-in, or a device sign-in
+  without a key, raises `NOT_SIGNED_IN`; a platform without the route, `NOT_OFFERED`.
+- On a lab workstation every call goes through the workstation's door, HTTP over the Unix socket
+  `QUPAI_WORKSTATION_LAB_SOCKET`, else `/Library/QuPai/workstation/lab.sock` when it exists, `m.moku()`'s included.
+  `Lab(url, key, unix_socket=…)` sends any `Lab`'s requests through such a socket.
+- A lab worked directly holds a live machine in `with lab.machine(…)` as the person's own session
+  (`{"purpose": …, "queue": true}`, waiting in the queue), so the same experiment code runs on the workstation and
+  as a live run in a QuPai sandbox. A session the person already held when the block began stays held at its end.
+  `Lab(…, direct=True)` asks for the same. In a sandbox nothing changes: a live machine is held only for its run.
+- `qupai-lab machines --lab <lab>` lists a lab worked this way. The manifest's `lab` names the listing of a
+  `/rest/<listing>` address too.
+
 ## 0.4.2
 
 - `m.moku(device)` works with the official `moku` package 4.4.0.0 as well as 4.3.0.1. The package now talks to a

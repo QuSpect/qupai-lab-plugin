@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from qupai_lab import __version__, config, metric, stop
+from qupai_lab import direct as _direct
 from qupai_lab import changes as _changes
 from qupai_lab.moku_forward import Forwarder
 from qupai_lab import runs as _runs
@@ -115,7 +116,12 @@ class Lab:
     """One lab, reached at ``url`` with ``key``.
 
     In a QuPai lab project ``url`` is the lab's address at the sandbox door and ``key`` the project key
-    (``Lab.from_env()`` reads both); at a lab PC, InstruCore's own address and an ``ick_`` key.
+    (``Lab.from_env()`` reads both); at a lab PC, InstruCore's own address and an ``ick_`` key; outside QuPai, the
+    lab's REST address at QuPai's gateway and the person's own key (``Lab.from_qupai(lab)`` finds both).
+
+    ``unix_socket``: a Unix socket that carries every request, whatever host ``url`` names: a lab workstation's
+    door (``Lab.from_qupai`` passes it there). ``direct``: the lab is worked directly, as the person themself
+    (``Lab.from_qupai``), so ``machine()`` holds a live machine for its block as their own session.
 
     ``record``: a file that gets one JSON line per call, appended. ``script_ref``: what the
     ``X-InstruCore-Script`` header says; by default the running script's path in its git repository and the
@@ -134,11 +140,17 @@ class Lab:
         record: str | os.PathLike[str] | None = None,
         script_ref: str | None = None,
         run_folder: _runs.RunFolder | None = None,
+        unix_socket: str | None = None,
+        direct: bool = False,
     ) -> None:
         if not url or not key:
             raise LabError("NOT_CONFIGURED", "Lab(url, key) needs both the lab's address and a key")
         self.url = url.rstrip("/")
         self._key = key
+        self.unix_socket = unix_socket or None
+        self.direct = direct
+        # How a request is sent: straight to the address, or through the workstation's door.
+        self._open: _direct.Opener = _direct.socket_opener(unix_socket) if unix_socket else urllib.request.urlopen
         ref = config.running_script_ref() if script_ref is None else script_ref
         self.script_ref: str | None = ref[-config.SCRIPT_REF_MAX :] if ref else None
         self.run_folder = run_folder
@@ -166,6 +178,31 @@ class Lab:
         a live run's id is its job, a rehearsal's the time it started. ``runs=False``, or ``QUPAI_LAB_RUNS=0``,
         makes none; there is none either for ``python -c``, the interactive interpreter or a test runner."""
         url, key = config.settings()
+        return cls._for_script(url, key, record, runs)
+
+    @classmethod
+    def from_qupai(cls, lab: str, record: str | os.PathLike[str] | None = None, *, runs: bool | None = None) -> Lab:
+        """The lab ``lab`` (its id, as ``qupai lab list`` names it: ``"magnetic"``) outside QuPai, with the person's
+        own ``qupai`` sign-in (``qupai login``): ``QUPAI_CREDENTIALS``, else ``qupai/credentials.json`` in the
+        user's configuration directory.
+
+        The platform says which labs the person may work directly from where they are (``GET /v1/me/lab-access``:
+        QuPai staff, a grant to their account, or a grant to the workstation they sit at), and the lab is then
+        InstruCore's REST API at ``<platform>/rest/<listing>``, with the person's key. On a lab workstation every
+        call goes through the workstation's door (``QUPAI_WORKSTATION_LAB_SOCKET``, else
+        ``/Library/QuPai/workstation/lab.sock`` when it exists). A lab the person may not work directly raises
+        ``LabError`` ``NO_DIRECT_ACCESS``, naming the labs they may: for the others, the lab's agent is the way
+        (``qupai ask -lab <lab>``). ``record`` and ``runs`` as for ``from_env``.
+
+        ``machine()`` of such a Lab holds a live machine too, as the person's own session (the lab checks their role
+        on the bench and its limits), so the same experiment code runs here and as a live run in a QuPai sandbox."""
+        found = _direct.route(lab)
+        return cls._for_script(found.url, found.key, record, runs, unix_socket=found.socket, direct=True)
+
+    @classmethod
+    def _for_script(cls, url: str, key: str, record: str | os.PathLike[str] | None, runs: bool | None,
+                    unix_socket: str | None = None, direct: bool = False) -> Lab:
+        """A Lab for the running script, with its run folder unless ``runs`` is False (``from_env``)."""
         folder = None
         script = _runs.main_script()
         if runs is None:
@@ -175,7 +212,7 @@ class Lab:
             run_id, _ = config.run()
             folder = _runs.RunFolder(experiment, run_id or _runs.new_id(), live=bool(run_id), script=script,
                                      argv=sys.argv[1:], lab_url=url)
-        return cls(url, key, record=record, run_folder=folder)
+        return cls(url, key, record=record, run_folder=folder, unix_socket=unix_socket, direct=direct)
 
     # ---- where a run's files go ----
 
@@ -222,7 +259,7 @@ class Lab:
                                     held=held)
 
     def __repr__(self) -> str:
-        return f"Lab({self.url!r})"
+        return f"Lab({self.url!r}, unix_socket={self.unix_socket!r})" if self.unix_socket else f"Lab({self.url!r})"
 
     def __enter__(self) -> Lab:
         return self
@@ -341,14 +378,15 @@ class Lab:
         data = dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=self._headers(data is not None))
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with self._open(req, timeout=self.timeout_s) as resp:
                 raw, status, headers = resp.read(), resp.status, resp.headers
         except urllib.error.HTTPError as e:
             raw = e.read() if e.fp is not None else b""
             status, headers = e.code, e.headers
         except (urllib.error.URLError, OSError) as e:
             reason = getattr(e, "reason", e)
-            raise LabError("UNREACHABLE", f"the lab at {self.url} is unreachable: {reason}") from e
+            door = f", through the workstation's door at {self.unix_socket}," if self.unix_socket else ""
+            raise LabError("UNREACHABLE", f"the lab at {self.url}{door} is unreachable: {reason}") from e
         if status >= 400:
             err = from_response(status, raw, headers.get("Content-Type", "") if headers else "")
             err._headers = headers  # type: ignore[attr-defined]
@@ -439,7 +477,9 @@ class Lab:
         A live machine is held only inside a live run (``qupai-lab run``), and only the run's own machine
         (``QUPAI_LAB_RUN_MACHINE``): the block waits in the machine's queue for its turn, the same way. Any
         other live machine is not held: the member or the conversation holds it, and the lab refuses what it
-        must (``RUN_REQUIRED``, ``APPROVAL_REQUIRED``)."""
+        must (``RUN_REQUIRED``, ``APPROVAL_REQUIRED``). A lab worked directly (``Lab.from_qupai``) holds any live
+        machine for the block, as the person's own session; one they already held when the block began stays
+        held at its end."""
         return Machine(self, machine_id, purpose=purpose, wait_s=wait_s)
 
     # ---- files ----
@@ -544,6 +584,8 @@ class Machine:
         self.roles: dict[str, str] = {}
         self._guarded = False
         self._entry: int | None = None  # this block's line in the run's manifest
+        self._as_run = False  # the live machine is held for the live run this script is
+        self._before: str | None = None  # a lab worked directly: the live machine's session when the block began
         self._forwarders: dict[str, Forwarder] = {}  # m.moku(): one local stand-in per Moku device
 
     def __repr__(self) -> str:
@@ -566,10 +608,13 @@ class Machine:
                 404,
             )
         live = machine is not None and machine.get("kind") == "live"
-        if live and not self.lab._is_run_machine(machine):
+        self._as_run = live and self.lab._is_run_machine(machine)
+        if live and not self._as_run and not self.lab.direct:
             self._use(machine)  # not held: the member or the conversation holds a live machine
             self.lab._used(self, held=False)
             return self
+        if live and not self._as_run:  # worked directly: the person's own session, unless they hold one already
+            self._before = ((machine or {}).get("session") or {}).get("session_id")
         self._guarded = stop.hold()  # SIGTERM and SIGINT from here on release what is held
         try:
             self._hold(live)
@@ -606,7 +651,8 @@ class Machine:
         if self._entry is not None and self.lab.run_folder is not None:
             self.lab.run_folder.released(self._entry)
         if getattr(self, "taken", False):
-            _say(f"{self.public_id or self.id} stays held: the run used its member's own session")
+            whose = "the run used its member's own session" if self._as_run else "it was your session before the block"
+            _say(f"{self.public_id or self.id} stays held: {whose}")
             if self.lab.run_id:
                 metric.emit("held", 0)
             return None
@@ -650,9 +696,12 @@ class Machine:
         offered, then asked again (which starts the session within the offer). Leaving early withdraws it.
 
         A run's live machine is asked for with ``purpose: "run <id>"`` and without ``simulated``: the lab
-        holds it for the run's longest time."""
-        if live:
+        holds it for the run's longest time. A lab worked directly asks for any other live machine with the block's
+        purpose (the script by default), without ``simulated``."""
+        if live and self._as_run:
             body: dict[str, Any] = {"purpose": f"run {self.lab.run_id or ''}".strip()[:256], "queue": True}
+        elif live:
+            body = {"purpose": (self.purpose or self.lab.script_ref or "qupai-lab")[:256], "queue": True}
         else:
             purpose = (self.purpose or self.lab.script_ref or "qupai-lab")[:256]
             body = {"purpose": purpose, "queue": True, "simulated": True}
@@ -722,6 +771,10 @@ class Machine:
                 # A run on the machine its member already holds takes that session (InstruCore's "taken"): it is
                 # the member's, so the block leaves it held when it ends.
                 self.taken = self.session.get("taken") is True
+                # Worked directly: a session the person held before the block began (in the conversation, say) is
+                # theirs, and stays held when the block ends.
+                if self._before and self.session.get("session_id") == self._before:
+                    self.taken = True
                 if self.lab.run_id:
                     metric.emit("held", 1)
         return answer
@@ -786,7 +839,7 @@ class Machine:
         forwarder = self._forwarders.get(device_id)
         if forwarder is None:
             forwarder = Forwarder(target, self.lab._official_headers("moku", version),
-                                  self.lab._official_answer(self, device_id))
+                                  self.lab._official_answer(self, device_id), opener=self.lab._open)
             self._forwarders[device_id] = forwarder
         self.lab._official("moku", version, self, device_id)
         # moku 4.4 manages bitstreams unless this is set (its manage_bitstreams argument is gone); the lab uploads

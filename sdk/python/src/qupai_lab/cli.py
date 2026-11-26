@@ -1,4 +1,5 @@
-"""``qupai-lab machines``: the lab's machines, the check that this sandbox (or PC) reaches its lab.
+"""``qupai-lab machines``: the lab's machines, the check that this sandbox (or PC) reaches its lab; with ``--lab``,
+a lab worked directly with the person's own qupai sign-in (``Lab.from_qupai``).
 ``qupai-lab run``: a live run's script, as QuPai starts it after the member approved the run (``runner``).
 ``qupai-lab index``: ``experiments/INDEX.md`` from the runs' manifests (``runs``)."""
 
@@ -10,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from qupai_lab import __version__, config, runner, runs
+from qupai_lab import __version__, config, direct, runner, runs
 from qupai_lab.errors import LabError
 from qupai_lab.lab import Lab, listed
 
@@ -84,9 +85,13 @@ def main(argv: list[str] | None = None) -> int:
         "machines",
         help="list the lab's machines: the check that this sandbox reaches its lab",
         description="Lists the lab's machines (id, kind, state, instruments by role) from QUPAI_LAB_URL with "
-        "QUPAI_LAB_KEY, read from the environment, the nearest .env up from here, or /workspace/project/.env.",
+        "QUPAI_LAB_KEY, read from the environment, the nearest .env up from here, or /workspace/project/.env. "
+        "With --lab, the lab of that id outside QuPai, with your own qupai sign-in (qupai login): the labs you may "
+        "work directly from here, through a lab workstation's door when this is one.",
     )
     p.add_argument("--json", action="store_true", help="print JSON")
+    p.add_argument("--lab", metavar="LAB", help="a lab you may work directly, by its id (magnetic), with your qupai "
+                   "sign-in")
     r = sub.add_parser(
         "run",
         help="run a live run's script (QuPai starts it once the member approved the run)",
@@ -117,8 +122,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return 2
     try:
-        url, key = config.settings()
-        _print_machines(Lab(url, key, script_ref=""), args.json)
+        if args.lab:
+            found = direct.route(args.lab)
+            lab = Lab(found.url, found.key, script_ref="", unix_socket=found.socket)
+        else:
+            url, key = config.settings()
+            lab = Lab(url, key, script_ref="")
+        _print_machines(lab, args.json)
     except LabError as e:
         print(f"qupai-lab: {e}", file=sys.stderr)
         return 1
