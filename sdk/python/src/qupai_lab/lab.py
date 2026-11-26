@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import atexit
 import csv
-import email.utils
 import importlib.metadata
 import json
 import os
@@ -22,7 +21,7 @@ from types import TracebackType
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from qupai_lab import __version__, config, metric, stop
+from qupai_lab import __version__, config, metric, pace, stop
 from qupai_lab import direct as _direct
 from qupai_lab import changes as _changes
 from qupai_lab.moku_forward import Forwarder
@@ -30,14 +29,20 @@ from qupai_lab import runs as _runs
 from qupai_lab.errors import LabError, RunSessionEnded, from_response
 from qupai_lab.record import Recorder, dumps, ensure_parent, now_iso
 
-RETRIES_429 = 5
-RETRY_AFTER_DEFAULT_S = 2.0
 TIMEOUT_S = 150.0
 POLL_S = 2.0
 # A queued request is looked at every POLL_S at first, then less often while its place does not move, up to
 # POLL_MAX_S: a run may wait hours, and each look counts against the member's per-minute calls to the lab. An
 # offer is kept for minutes (InstruCore's offer_s, 300 s by default), so POLL_MAX_S still starts it in time.
 POLL_MAX_S = 15.0
+# A block that waits for its machine says so when it starts waiting, then this often: what it waits for (who holds
+# the machine, its place in the queue) and since when. The run's manifest keeps it too (``waits``).
+SAY_EVERY_S = 30.0
+# The calls that may be sent again whatever became of the first (``pace``): an instrument's read and check ops, a
+# session's start, renewal and end. GET (the machine list, a machine, a queue request, a reference) and withdrawing
+# a queue request (DELETE) are too.
+_REPEATABLE_POST = re.compile(r"/v1/instruments/[^/]+/(?:read|check)/[^/]+|/v1/machines/[^/]+/sessions(?:/renew|/end)?")
+_REPEATABLE_DELETE = re.compile(r"/v1/session-requests/[^/]+")
 CALLS_EVERY_S = 5.0  # inside a run, the ``calls`` point at most this often
 # After the lab refused a call of the official moku package because the run's session ended, how long the package
 # has to read that answer before the script is stopped in its main thread: stopping it while the package is still
@@ -99,21 +104,17 @@ def _installed(package: str) -> str | None:
         return None
 
 
-def _retry_after(value: str | None) -> float:
-    """Seconds to wait from a ``Retry-After`` header (seconds or an HTTP date); 2 s without one."""
-    if not value:
-        return RETRY_AFTER_DEFAULT_S
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
-    try:
-        when = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return RETRY_AFTER_DEFAULT_S
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+def _repeatable(method: str, path: str) -> bool:
+    """A call that may be sent again whatever became of the first (``pace``): a GET, an instrument's read or check
+    op, a session's start, renewal or end, withdrawing a queue request. A write is not."""
+    path = path.split("?", 1)[0]
+    if method in ("GET", "HEAD"):
+        return True
+    if method == "POST":
+        return _REPEATABLE_POST.fullmatch(path) is not None
+    if method == "DELETE":
+        return _REPEATABLE_DELETE.fullmatch(path) is not None
+    return False
 
 
 def _say(text: str) -> None:
@@ -212,6 +213,7 @@ class Lab:
         self.timeout_s = TIMEOUT_S
         self.poll_s = POLL_S
         self._sleep: Callable[[float], None] = time.sleep
+        self._clock: Callable[[], float] = time.monotonic  # how long a wait has lasted (tests give their own)
         self._writes: list[_changes.Write] = []
         self._machines_used: list[str] = []
         # Devices worked with a manufacturer's own SDK (``Machine.moku``): its calls go to the lab, not through here.
@@ -491,8 +493,11 @@ class Lab:
     ) -> Any:
         """Calls a route of the lab (``/v1/…``) and answers its JSON; a refusal raises ``LabError``.
 
-        A 429 waits for ``Retry-After`` (2 s without one) and asks again, up to 5 times. Each call is one line
-        of the record; ``note`` adds fields to it. ``unwrap``: answer an op call's ``result``."""
+        The platform's ``429`` (and a ``503`` that names a ``Retry-After``) waits for ``Retry-After`` (2 s doubling
+        without one; 60 s at most each time, 5 minutes in all) and asks again, said once on stderr, for a call that
+        may be sent again (a read, the machine list, a session's start, renewal and end). A write is asked again only
+        after the gateway's own ``429``, which it answers before the call reaches the lab (``pace``). Each call is
+        one line of the record; ``note`` adds fields to it. ``unwrap``: answer an op call's ``result``."""
         return self._request(method, path, body, note=note, record=record, unwrap=unwrap).data
 
     def _line(self, method: str, path: str, body: Any, note: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -508,13 +513,19 @@ class Lab:
         record: bool = True,
         unwrap: bool = False,
         force: bool = False,
+        retry: bool = True,
+        stoppable: bool = False,
     ) -> _Answer:
-        if not force:  # ``force``: a session's end, which a run that stopped still sends for another machine
+        """``force``: a session's end, which a run that stopped still sends for another machine. ``retry``: wait for
+        the platform and ask again (``pace``); False answers its refusal at once (a look that may fail). ``stoppable``:
+        a session's start, sent while signals wait (``stop.shielded``): a signal that comes while it waits to ask
+        again stops the script there, since nothing was started."""
+        if not force:
             self.check_running()
         line = self._line(method, path, body, note)
         if record:
             self._ran()
-        retries = 0
+        tries, waited = 0, 0.0
         while True:
             try:
                 answer = self._send(method, path, body)
@@ -522,27 +533,69 @@ class Lab:
                 break
             except LabError as e:
                 headers = getattr(e, "_headers", None)
-                if e.status == 429 and retries < RETRIES_429:
-                    retries += 1
-                    self._sleep(_retry_after(headers.get("Retry-After") if headers else None))
+                wait = self._wait_before_again(e, headers, method, path, tries, waited) if retry else None
+                if wait is not None:
+                    self._pause(wait, stoppable)
+                    tries, waited = tries + 1, waited + wait
                     continue
+                if tries:
+                    e.detail = {**e.detail, "retries": tries, "waited_s": round(waited, 1)}
                 if record:
                     req_id = e.detail.get("req_id") or (headers.get("X-Request-ID") if headers else None)
                     line |= {"ok": False, "status": e.status, "code": e.code, "message": e.message, "req_id": req_id}
-                    self.recorder.add(line | ({"retries": retries} if retries else {}))
+                    self.recorder.add(line | _retried(tries, waited))
                 raise
         data = answer.data
         req_id = data.get("req_id") if isinstance(data, dict) else None
         if unwrap and isinstance(data, dict) and "result" in data:
             answer.data = data["result"]
         if record:
-            self._record_ok(line, answer, req_id, retries)
+            self._record_ok(line, answer, req_id, tries, waited)
         return answer
 
-    def _record_ok(self, line: dict[str, Any], answer: _Answer, req_id: str | None = None, retries: int = 0) -> None:
+    def _wait_before_again(self, e: LabError, headers: Any, method: str, path: str, tries: int,
+                           waited: float) -> float | None:
+        """How long to wait before sending the call again after the refusal ``e``, or None to raise it (``pace``).
+        The first wait of a call is said on stderr, and so is giving up after waiting; the run's manifest counts
+        the waits (``rate_limited``)."""
+        header = headers.get("Retry-After") if headers else None
+        repeatable = _repeatable(method, path)
+        wait = pace.next_wait(e.status, header, repeatable=repeatable,
+                              not_forwarded=e.status == 429 and pace.from_gateway(e.detail), tries=tries, waited=waited)
+        what = f"{method} {path}"
+        if wait is None:
+            if tries:
+                _say(f"the platform still refuses {what} after {pace.span(waited)} of waiting ({e.status} {e.code}); "
+                     "giving up")
+            elif e.status in (429, 503) and not repeatable:
+                _say(f"{what} was refused ({e.status} {e.code}) and is not sent again: a write that may have reached "
+                     "the lab is never sent twice")
+            return None
+        if tries == 0:
+            _say(pace.notice(e.status, e.message, wait, what))
+        self._waited_for_platform(wait)
+        return wait
+
+    def _waited_for_platform(self, wait: float) -> None:
+        """A call waited ``wait`` s for the platform before it was sent again: one of this Lab's, or one of a
+        manufacturer's SDK at its local stand-in (``m.moku``). The run's manifest counts it (``rate_limited``)."""
+        if self.run_folder is not None:
+            self.run_folder.rate_limited(wait)
+
+    def _pause(self, wait: float, stoppable: bool) -> None:
+        """Waits ``wait`` s before a call is sent again. ``stoppable`` (a session's start, sent while signals wait):
+        a signal during the wait stops the script at once (``stop.unshielded``), since nothing was started."""
+        if stoppable:
+            with stop.unshielded():
+                self._sleep(wait)
+        else:
+            self._sleep(wait)
+
+    def _record_ok(self, line: dict[str, Any], answer: _Answer, req_id: str | None = None, retries: int = 0,
+                   waited: float = 0.0) -> None:
         req_id = req_id or (answer.headers.get("X-Request-ID") if answer.headers else None)
         line |= {"ok": True, "status": answer.status, "code": None, "req_id": req_id}
-        self.recorder.add(line | ({"retries": retries} if retries else {}), answer.data, has_result=True)
+        self.recorder.add(line | _retried(retries, waited), answer.data, has_result=True)
 
     # ---- machines ----
 
@@ -621,6 +674,11 @@ class Lab:
         if card is not None and card.resolve() != target.resolve():
             card.write_text(dumps(out, indent=2) + "\n", encoding="utf-8")
         return out
+
+
+def _retried(tries: int, waited: float) -> dict[str, Any]:
+    """A record line's ``retries`` and ``waited_s``, when the call waited for the platform and was sent again."""
+    return {"retries": tries, "waited_s": round(waited, 1)} if tries else {}
 
 
 def _seconds(value: Any) -> float | None:
@@ -726,7 +784,7 @@ class Machine:
             self._before = ((machine or {}).get("session") or {}).get("session_id")
         self._guarded = stop.hold()  # SIGTERM and SIGINT from here on release what is held
         try:
-            self._hold(live)
+            self._hold(live, pool or machine)
             held = machine if live else _find(machines, self.id)
             self._use(held or self.lab.request("GET", f"/v1/machines/{_seg(self.id)}"))
             self._entry = self.lab._used(self, held=True)
@@ -811,9 +869,11 @@ class Machine:
             self._guarded = False
             stop.unhold()
 
-    def _hold(self, live: bool) -> None:
+    def _hold(self, live: bool, seen: dict[str, Any] | None = None) -> None:
         """``POST sessions`` with the queue on: 201 is the session; 202 is a queue request, looked at until it is
-        offered, then asked again (which starts the session within the offer). Leaving early withdraws it.
+        offered, then asked again (which starts the session within the offer). Leaving early withdraws it. While it
+        waits it says so (``_Waiting``): what for, when it starts waiting, then every ``SAY_EVERY_S``. ``seen``: the
+        machine or the pool as the lab listed it just before (who holds it, how many copies are free).
 
         A run's live machine is asked for with ``purpose: "run <id>"`` and without ``simulated``: the lab
         holds it for the run's longest time. A lab worked directly asks for any other live machine with the block's
@@ -830,37 +890,42 @@ class Machine:
         answer = self._ask(path, body)
         if answer.status != 202:
             return
-        started = time.monotonic()
+        lab = self.lab
+        started = lab._clock()
         request = (answer.data or {}).get("request") or {}
         rid = request.get("request_id")
         if not rid:
             raise LabError("SESSION_PENDING", f"queued for {self.target} without a request id", answer.data or {})
-        self._say_queued(answer.data, request, live)
+        waiting = _Waiting(self, live, answer.data, request, seen)
         position = request.get("position")
         self._tell_position(position)
         still = 0  # looks since the position last moved
+        outcome = "failed"
         try:
             while True:
-                if self.wait_s is not None and time.monotonic() - started >= self.wait_s:
+                if self.wait_s is not None and lab._clock() - started >= self.wait_s:
+                    outcome = "timeout"
                     raise LabError(
                         "WAIT_TIMEOUT",
                         f"{what} was not offered within {self.wait_s:g} s; the request was withdrawn",
                         {"request_id": rid, "machine": self.target},
                     )
-                self.lab._sleep(min(self.lab.poll_s * 2**still, max(POLL_MAX_S, self.lab.poll_s)))
+                lab._sleep(min(lab.poll_s * 2**still, max(POLL_MAX_S, lab.poll_s)))
                 poll = f"/v1/session-requests/{_seg(rid)}"
-                looked = self.lab._request("GET", poll, record=False)
+                looked = lab._request("GET", poll, record=False)
                 status = (looked.data or {}).get("status")
                 if status == "pending":
                     still = min(still + 1, 8)
                     if looked.data.get("position") != position:
                         still = 0
                         position = looked.data.get("position")
-                        _say(f"waiting for {self.target}: position {position}")
+                        waiting.moved(position)
                         self._tell_position(position)
+                    waiting.tick()
                     continue
-                self.lab._record_ok(self.lab._line("GET", poll, None), looked)  # one line when it moves on
+                lab._record_ok(lab._line("GET", poll, None), looked)  # one line when it moves on
                 if status in _GONE:
+                    outcome = str(status)
                     raise LabError(
                         f"REQUEST_{str(status).upper()}",
                         f"the queue request for {self.target} was {status} before {what} was offered",
@@ -868,13 +933,15 @@ class Machine:
                     )
                 answer = self._ask(path, body)  # offered: ask again, which starts it
                 if answer.status != 202:
+                    waiting.done("held")
                     return
                 request = (answer.data or {}).get("request") or {}  # the offer ran out or was withdrawn
                 rid = request.get("request_id") or rid
-        except BaseException:
+        except BaseException as e:
+            waiting.done("stopped" if isinstance(e, (KeyboardInterrupt, SystemExit)) else outcome)
             try:
                 with stop.shielded():
-                    self.lab.request("DELETE", f"/v1/session-requests/{_seg(rid)}")
+                    lab.request("DELETE", f"/v1/session-requests/{_seg(rid)}")
             except LabError:
                 pass
             raise
@@ -883,7 +950,7 @@ class Machine:
         """One ``POST sessions``; a 201 is taken at once, so a signal cannot fall between the start and the
         hold."""
         with stop.shielded():
-            answer = self.lab._request("POST", path, body)
+            answer = self.lab._request("POST", path, body, stoppable=True)
             if answer.status != 202:
                 self.session = answer.data if isinstance(answer.data, dict) else {}
                 self.id = self.session.get("machine") or self.target
@@ -1162,12 +1229,6 @@ class Machine:
             folder.ended_error(message)
         return message
 
-    def _say_queued(self, data: dict[str, Any], request: dict[str, Any], live: bool) -> None:
-        detail = ((data or {}).get("error") or {}).get("detail") or {}
-        why = " (you hold as many simulated sessions as a member may)" if detail.get("reason") == "member_cap" else ""
-        waiting = "waiting for its turn" if live else "waiting for a copy"
-        _say(f"queued for {self.target} at position {request.get('position')}{why}; {waiting}")
-
     def _use(self, m: dict[str, Any]) -> None:
         self.id = m["id"]
         self.public_id = m.get("public_id") or m["id"]
@@ -1220,7 +1281,8 @@ class Machine:
             forwarder = Forwarder(target, self.lab._official_headers("moku", version),
                                   self.lab._official_answer(self, device_id), opener=self.lab._open,
                                   refuse=lambda: self.lab._ended.message if self.lab._ended is not None else None,
-                                  refused=lambda method, path, d=device_id: self.moku_refused(d, method, path))
+                                  refused=lambda method, path, d=device_id: self.moku_refused(d, method, path),
+                                  waited=self.lab._waited_for_platform)
             self._forwarders[device_id] = forwarder
         self.lab._official("moku", version, self, device_id)
         # moku 4.4 manages bitstreams unless this is set (its manage_bitstreams argument is gone); the lab uploads
@@ -1238,6 +1300,125 @@ class Machine:
         """The machine's reference document (``mhs-reference/0``): roles, wiring, session settings, and each
         instrument's ops, units and limits."""
         return self.lab.request("GET", f"/v1/machines/{_seg(self.id or self.target)}/reference")
+
+
+class _Waiting:
+    """A block waiting in its machine's queue (``Machine._hold``), said and kept as it goes. On stderr: one line when
+    it starts waiting, saying what it waits for (who holds the machine and since when, or how many copies of a pool
+    are free, and its place in the queue, as the lab says them), a line when its place moves, a short one every
+    ``SAY_EVERY_S`` while it waits (the holder looked up again), and one when it holds the machine. In the run's
+    manifest: one of ``waits``, ``{machine, for, since, position, holder, lab_said, waited_s, until, outcome}``,
+    ``outcome`` ``waiting`` while it waits, then ``held``, ``timeout``, ``cancelled``, ``expired``, ``stopped`` or
+    ``failed``."""
+
+    def __init__(self, m: Machine, live: bool, data: Any, request: dict[str, Any],
+                 seen: dict[str, Any] | None) -> None:
+        self.m = m
+        self.lab = m.lab
+        self.what = "its turn" if live else "a copy"
+        self.started = self.said_at = self.lab._clock()
+        self.position = request.get("position")
+        error = data.get("error") if isinstance(data, dict) else None
+        error = error if isinstance(error, dict) else {}
+        detail = error.get("detail") if isinstance(error.get("detail"), dict) else {}
+        self.member_cap = "member_cap" in (detail.get("reason"), request.get("wait_reason"))
+        self.pool = isinstance(seen, dict) and "copies" in seen
+        self.holder = _holder(seen)
+        self.ended = False
+        folder = self.lab.run_folder
+        self.entry = folder.waiting({
+            "machine": m.target, "for": self.what, "since": now_iso(), "position": self.position,
+            "holder": self.holder, "lab_said": str(error.get("message") or "") or None, "waited_s": 0,
+            "until": None, "outcome": "waiting"}) if folder is not None else None
+        why = " (you hold as many simulated sessions as a member may)" if self.member_cap else ""
+        held = _holder_text(self.holder)
+        _say(f"queued for {m.target} at position {self.position}{why}; waiting for {self.what}"
+             + (f": {held}" if held else "") + f". It says how the wait goes every {pace.span(SAY_EVERY_S)}; "
+             "SIGINT or SIGTERM leaves the queue")
+
+    def moved(self, position: Any) -> None:
+        self.position = position
+        self.said_at = self.lab._clock()
+        _say(f"waiting for {self.m.target}: position {position}")
+        self._keep()
+
+    def tick(self) -> None:
+        """After each look at the queue request: every ``SAY_EVERY_S``, a line with the place, the time waited and
+        the holder as the lab says it now."""
+        now = self.lab._clock()
+        if now - self.said_at < SAY_EVERY_S:
+            return
+        self.said_at = now
+        self._look()
+        held = _holder_text(self.holder)
+        _say(f"still waiting for {self.m.target} ({pace.span(now - self.started)}): position {self.position}"
+             + (f"; {held}" if held else ""))
+        self._keep()
+
+    def done(self, outcome: str) -> None:
+        if self.ended:
+            return
+        self.ended = True
+        waited = self.lab._clock() - self.started
+        if outcome == "held":
+            _say(f"{self.m.target} is held after waiting {pace.span(waited)} in its queue")
+        self._keep(until=now_iso(), outcome=outcome)
+
+    def _look(self) -> None:
+        """The holder now: the machine, or the pool in the machine list. A look that fails keeps the last one
+        (it is not waited for: the next look is soon)."""
+        target = self.m.target
+        try:
+            if self.pool:
+                listing = self.lab._request("GET", "/v1/machines", record=False, retry=False).data
+                seen = _find((listing or {}).get("pools") or [], target) if isinstance(listing, dict) else None
+            else:
+                seen = self.lab._request("GET", f"/v1/machines/{_seg(target)}", record=False, retry=False).data
+        except LabError:
+            return
+        self.holder = _holder(seen if isinstance(seen, dict) else None)
+
+    def _keep(self, **more: Any) -> None:
+        folder = self.lab.run_folder
+        if folder is None or self.entry is None:
+            return
+        folder.waited(self.entry, position=self.position, holder=self.holder,
+                      waited_s=round(self.lab._clock() - self.started, 1), **more)
+
+
+def _holder(seen: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What a block waits behind, from the machine or the pool as the lab lists it: the session's holder (``name``,
+    null when the lab may not say it, ``since``, ``run``, ``ends_in_s``: its longest time left), a pool's ``copies``
+    and ``free``, or that the machine is ``offered`` to someone before it."""
+    if not isinstance(seen, dict):
+        return None
+    if "copies" in seen:
+        copies = seen.get("copies")
+        return {"copies": len(copies) if isinstance(copies, list) else copies, "free": seen.get("free")}
+    session = seen.get("session")
+    if isinstance(session, dict):
+        return {"name": session.get("client_name") or None, "since": session.get("started_at"),
+                "run": session.get("run"), "ends_in_s": _seconds(session.get("max_expires_in_s"))}
+    if seen.get("offer"):
+        return {"offered": True}
+    return None
+
+
+def _holder_text(holder: dict[str, Any] | None) -> str:
+    """``held by Ada since 2026-11-26 05:25:19 UTC (run 01a2…); its session ends in 25 min at the latest``."""
+    if not holder:
+        return ""
+    if "copies" in holder:
+        copies, free = holder.get("copies"), holder.get("free")
+        return f"all {copies} copies are in use" if not free else f"{free} of {copies} copies free"
+    if holder.get("offered"):
+        return "it is offered to someone before this script in its queue"
+    since = _parse_time(holder.get("since"))
+    text = f"held by {holder.get('name') or 'someone outside your organization'}"
+    text += f" since {_utc(since)}" if since else ""
+    text += f" (run {holder['run']})" if holder.get("run") else ""
+    ends = holder.get("ends_in_s")
+    return text + (f"; its session ends in {pace.span(ends)} at the latest" if ends else "")
 
 
 class Instrument:

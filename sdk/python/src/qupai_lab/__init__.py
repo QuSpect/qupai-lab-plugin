@@ -8,7 +8,7 @@
         gen.write("set_waveform", channel=1, shape="sine", frequency_hz=1000, amplitude_v=1.0)
 """
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from qupai_lab.errors import LabError, RunSessionEnded  # noqa: E402  (after __version__, which lab.py imports)
 from qupai_lab.changes import declare_changes  # noqa: E402

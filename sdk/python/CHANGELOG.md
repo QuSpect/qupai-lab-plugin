@@ -1,5 +1,36 @@
 # Changelog: the Lab SDK (`qupai-lab`)
 
+## 0.6.2
+
+On a lab workstation, 2026-11-26, QuPai's gateway answered every call `429 Too Many Requests` ("too many requests
+from this address", `Retry-After: 60`) for about 30 s after a burst of calls; a script working the Magnetic bench
+raised, and its clean-up failed too. Another run printed nothing for 8 minutes while it waited, until it was killed.
+
+- The platform's `429`, and a `503` that names a `Retry-After`, is waited for and the same call sent again when that
+  is safe: every GET (the machine list, a machine, a queue request), an instrument's `read` and `check` ops, a
+  session's start, renewal and end, withdrawing a queue request; and a write after the gateway's own `429`
+  (`urn:qupai:problem:rate`), which it answers before the call reaches the lab (qupai-gateway's REST door: the
+  address's calls per minute and the member's calls to the lab; InstruCore answers no `429`). A write refused any
+  other way is never sent twice. Each wait is the `Retry-After` named (seconds or an HTTP date), else 2 s doubling;
+  at least 1 s and at most 60 s each, 5 minutes in all per call (it was 5 tries, 2 s apart without a header, and a
+  write was sent again after any `429`). The first wait of a call is said once on stderr ("rate-limited by the
+  platform; waiting 1 min, then asking again (…)"), and so is giving up. The record's line gets `retries` and
+  `waited_s`, the raised error's `detail` too, and the manifest counts the waits (`rate_limited`). A signal while a
+  session's start waits stops the script at once (`stop.unshielded`): nothing was started.
+- `Lab.from_qupai`'s first question (`GET /v1/me/lab-access`) waits the same way; it raised at the first `429`.
+- The official `moku` package's calls (`m.moku()`): the stand-in waits for the gateway's `429` and sends the call
+  again while the waits fit in 20 s, under the package's own read timeout, and while the package still waits;
+  otherwise the package gets the refusal in the Moku's envelope (`RATE`, with the platform's sentence) instead of
+  "Unknown exception. Status code: 429", said once on stderr.
+- A block that waits in its machine's queue says so: on stderr, what it waits for when it starts waiting (who holds
+  the machine and since when, and when its session ends at the latest, or how many copies of a pool are free; its
+  place in the queue), a line when its place moves, `still waiting for <machine> (4 min 30 s): position 1; held by …`
+  every 30 s (the holder looked up again), and when it holds the machine. The manifest keeps each wait in `waits` as
+  it goes (`machine`, `for`, `since`, `position`, `holder`, `lab_said`, `waited_s`, `until`, `outcome`). Its looks at
+  the queue keep their backoff (2 s, then up to every 15 s while its place does not move).
+- The README says how to start a long run on a lab workstation detached (`lab-detach`, else `nohup` in its own
+  session), follow its log and stop it with SIGTERM; so does the `lab-operator` skill (plugin 0.1.5).
+
 ## 0.6.1
 
 - A live run whose session ended under it (the member released the bench from the bench page, or the lab ended it

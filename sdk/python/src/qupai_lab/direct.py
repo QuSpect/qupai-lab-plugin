@@ -23,6 +23,7 @@ import json
 import os
 import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from qupai_lab import __version__
+from qupai_lab import __version__, pace
 from qupai_lab.errors import LabError, from_response
 
 CREDENTIALS_ENV = "QUPAI_CREDENTIALS"
@@ -44,6 +45,7 @@ TIMEOUT_S = 30.0
 ASK_HINT = 'for any other lab, ask its agent: qupai ask -lab <lab> "…" (or the ask tool of qupai mcp)'
 
 Opener = Callable[..., Any]  # urllib.request.urlopen, or an opener's open: (request, timeout=…) → response
+_sleep: Callable[[float], None] = time.sleep  # how lab_access waits for the platform (tests give their own)
 
 
 def config_dir() -> Path | None:
@@ -207,21 +209,34 @@ def _where(server: str, unix_socket: str | None) -> str:
 
 def lab_access(server: str, key: str, unix_socket: str | None, opener: Opener, path: Path | None = None) -> dict[str, Any]:
     """``GET /v1/me/lab-access``: ``{labs: [{lab, name, listing, role, via}], ask}`` for the person, from where
-    they are."""
-    req = urllib.request.Request(server + LAB_ACCESS, method="GET", headers={
-        "Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": f"qupai-lab/{__version__}"})
+    they are. The platform's ``429`` (and a ``503`` that names a ``Retry-After``) is waited for and the question
+    asked again, as for the lab's own calls (``pace``), said once on stderr."""
     where = _where(server, unix_socket)
-    try:
-        with opener(req, timeout=TIMEOUT_S) as resp:
-            raw, status = resp.read(), resp.status
-            content_type = resp.headers.get("Content-Type", "")
-    except urllib.error.HTTPError as e:
-        raw, status = (e.read() if e.fp is not None else b""), e.code
-        content_type = e.headers.get("Content-Type", "") if e.headers else ""
-    except (urllib.error.URLError, OSError) as e:
-        reason = getattr(e, "reason", e)
-        raise LabError("UNREACHABLE", f"the platform at {where} is unreachable: {reason}",
-                       {"server": server, "socket": unix_socket}) from e
+    tries, waited = 0, 0.0
+    while True:
+        req = urllib.request.Request(server + LAB_ACCESS, method="GET", headers={
+            "Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": f"qupai-lab/{__version__}"})
+        retry_after = None
+        try:
+            with opener(req, timeout=TIMEOUT_S) as resp:
+                raw, status = resp.read(), resp.status
+                content_type = resp.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            raw, status = (e.read() if e.fp is not None else b""), e.code
+            content_type = e.headers.get("Content-Type", "") if e.headers else ""
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            raise LabError("UNREACHABLE", f"the platform at {where} is unreachable: {reason}",
+                           {"server": server, "socket": unix_socket}) from e
+        wait = pace.next_wait(status, retry_after, repeatable=True, not_forwarded=False, tries=tries, waited=waited)
+        if status < 400 or wait is None:
+            break
+        if tries == 0:
+            said = from_response(status, raw, content_type).message
+            print(f"qupai-lab: {pace.notice(status, said, wait, f'GET {LAB_ACCESS}')}", file=sys.stderr, flush=True)
+        _sleep(wait)
+        tries, waited = tries + 1, waited + wait
     if status == 404:
         raise LabError("NOT_OFFERED", f"the platform at {where} does not say which labs you may work directly "
                        f"(GET {LAB_ACCESS} answered 404: a platform from before direct lab access); {ASK_HINT}",

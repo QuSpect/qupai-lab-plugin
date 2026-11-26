@@ -50,19 +50,19 @@ def test_429_waits_for_retry_after_and_retries(lab: Lab, fake: FakeInstruCore) -
     fake.respond("GET", "/v1/machines", 429, rate, headers={"Retry-After": "3"}, content_type="application/problem+json")
     fake.respond("GET", "/v1/machines", 429, rate, content_type="application/problem+json")
     assert len(lab.machines()) == 3
-    assert waits == [3.0, 2.0]  # the header's, then the default
+    assert waits == [3.0, 4.0]  # the header's, then 2 s doubled at the second try (none named)
     assert len(fake.calls("GET", "/v1/machines")) == 3
     lab.close()  # a dict result waits for the next line, in case the script saves it
     line = lines(lab.recorder.path)[-1]
-    assert (line["ok"], line["status"], line["retries"]) == (True, 200, 2)
+    assert (line["ok"], line["status"], line["retries"], line["waited_s"]) == (True, 200, 2, 7.0)
 
 
-def test_429_gives_up_after_five_retries(lab: Lab, fake: FakeInstruCore) -> None:
+def test_429_gives_up_after_five_minutes_of_waiting(lab: Lab, fake: FakeInstruCore) -> None:
     waits: list[float] = []
     lab._sleep = waits.append
     fake.respond("GET", "/v1/machines", 429, {"type": "urn:qupai:problem:rate", "title": "Too many requests",
-                                              "detail": "slow down"}, headers={"Retry-After": "1"}, times=10)
+                                              "detail": "slow down"}, headers={"Retry-After": "1"}, times=400)
     with pytest.raises(LabError) as e:
         lab.machines()
     assert (e.value.code, e.value.status, e.value.message) == ("RATE", 429, "slow down")
-    assert waits == [1.0] * 5 and len(fake.calls("GET", "/v1/machines")) == 6
+    assert waits == [1.0] * 300 and len(fake.calls("GET", "/v1/machines")) == 301

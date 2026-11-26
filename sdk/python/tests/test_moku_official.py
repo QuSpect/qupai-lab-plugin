@@ -144,6 +144,27 @@ def test_a_refusal_in_the_mokus_own_envelope_reaches_the_script(door: FakeInstru
     assert door.sessions == {}  # the block still released the copy
 
 
+def test_the_platforms_429_reaches_the_package_as_a_sentence_or_is_waited_for(door: FakeInstruCore) -> None:
+    """The gateway's 429 never reached the lab. A short Retry-After is waited for at the stand-in, under the package's
+    own read timeout; a minute's is the package's own exception with the platform's sentence, not "Unknown
+    exception. Status code: 429"."""
+    rate = {"type": "urn:qupai:problem:rate", "title": "Too many requests", "status": 429,
+            "detail": "Too many requests from this address; retry in a minute"}
+    describe = f"/v1/moku/{COPY}/{DEVICE}/api/moku/describe"
+    lab = Lab(door.url, "qpk_test", script_ref="")
+    with lab.machine("signal-bench-sim") as m:
+        kwargs = m.moku(DEVICE)
+        m._forwarders[DEVICE]._sleep = lambda s: None
+        door.respond("GET", describe, 429, rate, headers={"Retry-After": "2"}, content_type="application/problem+json")
+        with instruments.Oscilloscope(**kwargs) as osc:
+            assert osc.get_data()["ch1"] == [0.0, 0.5, 1.0]
+        door.respond("GET", describe, 429, rate, headers={"Retry-After": "60"}, content_type="application/problem+json")
+        with pytest.raises(exceptions.MokuException) as e:
+            instruments.Oscilloscope(**kwargs)
+    assert "rate-limited by the platform" in str(e.value) and "did not reach the lab" in str(e.value)
+    assert door.sessions == {}  # the block still released the copy
+
+
 def test_a_rehearsals_changes_list_the_writes_the_lab_listed(door: FakeInstruCore, tmp_path: Path) -> None:
     """InstruCore 0.26.2 lists each write it made in its answer (instrucore.writes); the Lab SDK keeps them for
     changes.json under the instrument's role, so a live run's card can approve the package's writes."""
