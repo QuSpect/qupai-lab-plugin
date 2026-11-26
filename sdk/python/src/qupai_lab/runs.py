@@ -249,6 +249,36 @@ class RunFolder:
             self.manifest["versions"][entry["package"]] = entry["version"]
         self.save()
 
+    def waiting(self, entry: dict[str, Any]) -> int:
+        """A block waits in its machine's queue (``waits``): what for and behind whom, since when, kept as it goes
+        (``waited``) until it holds the machine or gives up."""
+        self.ensure()
+        assert self.manifest is not None
+        waits = self.manifest.setdefault("waits", [])
+        waits.append(dict(entry))
+        self.save()
+        return len(waits) - 1
+
+    def waited(self, index: int, **fields: Any) -> None:
+        if self.manifest is None:
+            return
+        waits = self.manifest.get("waits") or []
+        if 0 <= index < len(waits):
+            waits[index].update(fields)
+            self.save()
+
+    def rate_limited(self, wait_s: float) -> None:
+        """A call waited for the platform before it was sent again (a ``429``, or a ``503`` that named a
+        ``Retry-After``): ``rate_limited`` counts the waits, their seconds and the last one."""
+        if self.manifest is None:
+            return
+        at = now_iso()
+        kept = self.manifest.setdefault("rate_limited", {"waits": 0, "waited_s": 0.0, "first_at": at, "last_at": at})
+        kept["waits"] += 1
+        kept["waited_s"] = round(kept["waited_s"] + wait_s, 1)
+        kept["last_at"] = at
+        self.save()
+
     def released(self, index: int) -> None:
         if self.manifest is not None and 0 <= index < len(self.manifest["machines"]):
             self.manifest["machines"][index]["released_at"] = now_iso()

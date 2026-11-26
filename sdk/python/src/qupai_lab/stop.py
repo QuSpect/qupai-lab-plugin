@@ -5,7 +5,8 @@ While any machine is held (``hold`` … ``unhold``) one handler serves both sign
 - the first signal raises in the main thread: ``SystemExit(143)`` for SIGTERM, ``KeyboardInterrupt`` for SIGINT,
   and the blocks' ends release what they hold;
 - while a session starts or ends (``shielded``) the signal waits until that call is done, so a session is never
-  left half started or half ended;
+  left half started or half ended; but while a session's start waits for the platform to let it through
+  (``unshielded``), nothing is started, and the signal stops the script at once;
 - a repeat while the script stops is ignored (a runner forwards the signal its process group also got).
 
 When nothing is held any more the handlers the script had are back. A signal set to be ignored stays ignored, and
@@ -47,6 +48,7 @@ def name(signum: int) -> str:
 def stopping() -> int | None:
     """The signal that is stopping the script, if one is."""
     return _stopping
+
 
 
 def _stop(signum: int) -> BaseException:
@@ -144,3 +146,19 @@ def shielded() -> Iterator[None]:
         if _shield == 0 and _deferred is not None and _stopping is None:
             signum, _deferred = _deferred, None
             raise _stop(signum)
+
+
+@contextmanager
+def unshielded() -> Iterator[None]:
+    """Inside ``shielded``, a wait while nothing is starting or ending (a session's start waiting for the platform
+    to let it through, after a 429): a signal now stops the script at once, one that came before the wait too."""
+    global _shield, _deferred
+    saved = _shield
+    _shield = 0
+    try:
+        if _deferred is not None and _stopping is None:
+            signum, _deferred = _deferred, None
+            raise _stop(signum)
+        yield
+    finally:
+        _shield = saved

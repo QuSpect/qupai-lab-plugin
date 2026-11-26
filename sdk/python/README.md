@@ -151,6 +151,11 @@ the lab records those calls), `started_at`, `ended_at`, `status`
 (`running`, `ended`, `failed` after an uncaught exception, `stopped` by a signal), `exit_code` and `error` (a live
 run's; `error` is the end of its stderr when it did not end well), `session_ended` and `restore` (a live run whose
 session ended under it: [below](#when-the-runs-session-ends-while-it-runs)),
+`waits` (each wait in a machine's queue, kept as it goes: `machine`, `for` (`its turn` or `a copy`), `since`,
+`position`, `holder` (`name`, `since`, `run` and `ends_in_s`, its longest time left; a pool's `copies` and `free`),
+`lab_said`, `waited_s`, `until` and `outcome`: `waiting` while it waits, then `held`, `timeout`, `cancelled`,
+`expired`, `stopped` or `failed`; [below](#a-wait-says-what-it-waits-for)), `rate_limited` (the calls' waits for the
+platform: `waits`, `waited_s`, `first_at`, `last_at`; [below](#when-the-platform-asks-to-wait)),
 `calls`, `outputs` (the files the run itself left, the raw ones counted in `raw_files`; an analysis adds its own
 later) and `versions`.
 
@@ -176,6 +181,42 @@ only when given (`run_folder=`).
 
 In a QuPai sandbox, code holds a live machine only as a run the member approved; outside QuPai, only on a lab you
 may work directly. Rehearse on a copy first when the lab has one.
+
+### A wait says what it waits for
+
+When the lab puts the block in a queue (`202`), it says on stderr what it waits for, as the lab says it: who holds
+the machine and since when, or how many copies of a pool are free, and its place in the queue.
+
+```
+qupai-lab: queued for magnetic-bench at position 1; waiting for its turn: held by Wang since 2026-11-26 05:25:19 UTC; its session ends in 25 min at the latest. It says how the wait goes every 30 s; SIGINT or SIGTERM leaves the queue
+qupai-lab: still waiting for magnetic-bench (44 s): position 1; held by Wang since 2026-11-26 05:25:19 UTC; …
+qupai-lab: magnetic-bench is held after waiting 4 min 12 s in its queue
+```
+
+A line comes when its place moves and every 30 s while it waits (the holder looked up again); a member who holds as
+many simulated sessions as a member may is told that this is why. It looks at its request every 2 s at first, then
+less often while its place does not move, up to every 15 s: a wait never runs in a tight loop. The run's manifest
+keeps each wait in `waits` as it goes, so a run folder says what a run that seems stuck is waiting for.
+
+### A long run on a lab workstation: detached
+
+A run that holds a bench for minutes must outlive what started it: a closed browser tab, a dropped connection or the
+end of the coding agent's command would otherwise stop it halfway, with the bench's settings changed.
+
+1. Look at the bench first (`qupai-lab machines --lab <lab>`, or the `machines` tool): free, or held by whom. Never
+   start a second run while one holds the bench or waits for it, yours included.
+2. Start the run detached, in its own session, from the experiment's folder, with its output in a log:
+
+   ```
+   lab-detach run.log python3 run.py <bench>      # when the workstation has it (command -v lab-detach)
+   nohup python3 -c 'import os,sys; os.fork() and os._exit(0); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+     python3 -u run.py <bench> > run.log 2>&1 < /dev/null &
+   ```
+
+3. Follow the log now and then (`tail -n 20 run.log`), not with a `tail -f` that never returns: the SDK says there
+   what it waits for and how the wait goes, and the run's `runs/<id>/manifest.json` has `status` `running` until the
+   run ends. To stop it, send SIGTERM (`pkill -TERM -f 'run.py <bench>'`): the script's `finally` puts back what it
+   changed and the block releases the bench. Never SIGKILL it: the session would stay held until its idle limit.
 
 SIGTERM and SIGINT while a block holds a machine (a copy, or a run's live machine) release it before the script
 exits: the first one raises `SystemExit(143)` (SIGTERM) or `KeyboardInterrupt` (SIGINT) in the block, the block's
@@ -224,8 +265,14 @@ for a MokuOS 4.4 Moku); InstruCore 0.27.1 or later takes 4.4's calls. `m.moku()`
 - **The lab checks every call** as it checks this SDK's. The key tells the lab whose calls they are, so they belong
   to whatever this `Lab` holds: the block's copy, or a run's live machine. Reads pass; writes need the hold, and on a
   live machine the lab's limits and the member's approval. The package raises its own exceptions
-  (`moku.exceptions.MokuException` and its kinds), never `LabError`, and it does not wait and ask again on a `429`
-  as this SDK does.
+  (`moku.exceptions.MokuException` and its kinds), never `LabError`.
+- **The platform's `429`.** The package does not wait and ask again itself. The gateway's own `429` never reached
+  the lab, so the stand-in waits for its `Retry-After` and sends the call again while the waits fit in 20 s, under
+  the package's own read timeout (30 s by default), and while the package still waits for the answer. Otherwise
+  (a minute's `Retry-After`) the package gets the refusal in the Moku's envelope, `RATE`, and raises it: `rate-limited
+  by the platform (Too many requests from this address; retry in a minute): this call of the moku package did not
+  reach the lab; the platform asks to wait 1 min`, said once on stderr. Any other `429` reaches the package as it
+  came.
 - **Ownership.** Each instrument's constructor claims the Moku (`claim_ownership`); the lab grants it only while
   this key holds the machine, and `force_connect` takes the Moku from no one. Hand it back with
   `relinquish_ownership()`, or with a `with` block as above.
@@ -253,8 +300,8 @@ that version (MIT). The tests run with 4.3.0.1 and with 4.4.0.0.
 ## The record and `changes.json`
 
 `record` (a path) gets one JSON line per call, appended: `time`, `method`, `path`, `args`, `ok`, `status`,
-`code` (the error code, or null), `message` on a refusal, `req_id`, and for an op call `machine`, `role`,
-`instrument`, `kind` and `op`. A successful call's line carries its `result`, or `file` when the script saved that
+`code` (the error code, or null), `message` on a refusal, `req_id`, `retries` and `waited_s` when it waited for
+the platform and was sent again, and for an op call `machine`, `role`, `instrument`, `kind` and `op`. A successful call's line carries its `result`, or `file` when the script saved that
 result with `lab.save` straight after the call. The line of a call that answered a dict or a list is written with
 the next call (or at the block's end), so it can name the file.
 
@@ -420,8 +467,32 @@ printed on stdout but the runner's answer.
 
 A refusal raises `LabError`, with `code`, `message` (the lab's sentence as it sent it), `detail` and `status`
 (the HTTP status, 0 when no answer came). It reads InstruCore's `{"error": {code, message, detail}}` and the QuPai
-gateway's problem documents (`urn:qupai:problem:rate` becomes `RATE`, `invalid-key` `INVALID_KEY`). A 429 waits
-for `Retry-After` (2 s without one) and asks again, up to 5 times.
+gateway's problem documents (`urn:qupai:problem:rate` becomes `RATE`, `invalid-key` `INVALID_KEY`).
+
+### When the platform asks to wait
+
+QuPai's gateway answers `429 Too Many Requests` before it passes a call on to the lab: too many calls from one
+address in the minute (`Retry-After: 60`, until the minute ends; a lab workstation's seats share one address, MCP and
+REST together), or too many of the member's calls to the lab. InstruCore answers no `429` itself. The SDK then waits
+and sends the same call again, said once on stderr:
+
+```
+qupai-lab: rate-limited by the platform; waiting 1 min, then asking again (GET /v1/machines: Too many requests from this address; retry in a minute). One call waits 5 min at most
+```
+
+- **What is sent again**: a call that may be sent again whatever became of the first, after any `429` and after a
+  `503` that names a `Retry-After`: every GET (the machine list, a machine, a queue request, a reference), an
+  instrument's `read` and `check` ops, a session's start, renewal and end, withdrawing a queue request; and a write
+  after the gateway's own `429` (its `urn:qupai:problem:rate` document), which never reached the lab. A write refused
+  any other way is never sent twice, since it may have reached the instrument: it raises at once, and says so.
+- **How long**: the `Retry-After` the answer names (seconds or an HTTP date), else 2 s doubling with each try; at
+  least 1 s and at most 60 s each time, 5 minutes in all for one call. Then the refusal is raised, with `retries` and
+  `waited_s` in its `detail`, and said on stderr. The record's line has `retries` and `waited_s` too, and the manifest
+  counts the waits (`rate_limited`).
+- A signal while a session's start waits stops the script at once: nothing was started. The block's end (`sessions/end`)
+  waits as long as it must, within the 5 minutes, so a bench is not left held because the platform was busy.
+- `Lab.from_qupai`'s first question (`GET /v1/me/lab-access`) waits the same way, and so do the official `moku`
+  package's calls at their stand-in, within the package's patience ([above](#a-moku-with-the-official-sdk)).
 
 | Code | What it means |
 | --- | --- |
@@ -431,7 +502,7 @@ for `Retry-After` (2 s without one) and asks again, up to 5 times.
 | `SESSION_REQUIRED`, `BENCH_NOT_HELD`, `MACHINE_IN_SESSION`, `BENCH_HELD` | The write needs your session on that machine, or someone else holds it. Inside a run, on the run's machine, they mean the run's session ended: `RunSessionEnded` (below) |
 | `SESSION_ENDED` (`RunSessionEnded`, a `SystemExit`) | Inside a live run: the run's session ended while it ran, not by the run; the run stops ([above](#when-the-runs-session-ends-while-it-runs)) |
 | `NOT_PUT_BACK` | Inside a live run whose session ended: a call of the script's clean-up that could not be put through a session of the run's own, and why; the manifest's `restore` lists it ([above](#when-the-runs-session-ends-while-it-runs)) |
-| `INVALID_KEY`, `FORBIDDEN`, `RATE`, `UNAVAILABLE` (the gateway's) | The key, your role on the lab, too many calls, the lab not reachable through QuPai |
+| `INVALID_KEY`, `FORBIDDEN`, `RATE`, `UNAVAILABLE` (the gateway's) | The key, your role on the lab, too many calls (still, after 5 minutes of waiting: [above](#when-the-platform-asks-to-wait)), the lab not reachable through QuPai |
 | `NOT_FOUND` | No such machine or instrument, or a bench you hold no role on |
 | `UNREACHABLE`, `NOT_CONFIGURED` | No answer from the address; no address or key found |
 | `UNKNOWN_ROLE`, `NOT_HELD`, `WAIT_TIMEOUT`, `REQUEST_EXPIRED`, `REQUEST_CANCELLED` | The SDK's own: no such role, the machine used outside `with`, no copy offered in `wait_s`, the queue request ended |

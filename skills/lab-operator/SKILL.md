@@ -58,6 +58,14 @@ machine, as for any real write. In a QuPai lab project a live run's card lists w
 them as declared, not rehearsed, and the lab refuses any other write in the run. The SDK's README
 (`sdk/python/README.md` in this plugin's repository) has the rest.
 
+**On a lab workstation, start a long script detached** so a closed browser tab, a dropped connection or the end of
+your command cannot stop it halfway: check `machines` first and never start a second run while one holds the bench or
+waits for it; then `lab-detach run.log python3 run.py <bench>` when the workstation has `lab-detach`, else
+`nohup python3 -c 'import os,sys; os.fork() and os._exit(0); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])'
+python3 -u run.py <bench> > run.log 2>&1 < /dev/null &`. Follow `run.log` with `tail -n 20` now and then: the SDK
+says there what it waits for (the bench's holder, its place in the queue, the platform's rate limit) every 30 s. Stop
+it with SIGTERM, never SIGKILL.
+
 **A live run holds its bench as its own session.** A session whose purpose is `run <id>` is a live run a member
 approved in QuPai, running on that bench now: not someone's forgotten session, and not a run still waiting. Never end
 it (`end_session` on it, with configure) and never tell the user to release it from the bench page: that stops the

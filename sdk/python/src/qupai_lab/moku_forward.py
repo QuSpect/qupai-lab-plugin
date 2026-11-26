@@ -7,6 +7,10 @@ it does with the address it is given or with its headers: 4.3 builds ``http://{i
 session, while 4.4's fast transport keeps only the host and port of ``ip`` and sends only its ``Moku-Client-Key``.
 
 Each JSON answer is also handed to ``on_answer`` (the Lab keeps the writes the lab lists in it for ``changes``).
+The platform's own ``429`` (``urn:qupai:problem:rate``, answered at the gateway's door, so the call never reached the
+lab) is waited for and the call sent again while that fits in ``RATE_WAIT_MAX_S``, under the package's own read
+timeout (30 s by default), and while the package still waits for its answer; otherwise the package gets the refusal
+in the Moku's envelope (``RATE``, with the platform's sentence), said once on stderr. The package never waits itself.
 Once ``refuse`` answers a sentence (a live run whose session ended), nothing more is passed on: each call is refused
 here with it (``SESSION_ENDED``) and told to ``refused`` (the run's manifest lists what did not reach the Moku),
 and handing the Moku back succeeds, since there is nothing to hand back.
@@ -17,11 +21,18 @@ from __future__ import annotations
 
 import http.server
 import json
+import select
+import socket
+import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from typing import Any
+
+from qupai_lab import pace
+from qupai_lab.errors import from_response
 
 # How long one call may take at the lab: longer than any the package waits for (a deploy that first uploads
 # instrument files takes up to 420 s at InstruCore). The package's own timeouts still apply on its side.
@@ -31,6 +42,9 @@ PASSED_ON = ("Content-Type", "Moku-Client-Key", "Accept")
 # Answer headers passed back to the package.
 PASSED_BACK = ("Content-Type", "Moku-Client-Key", "Content-Disposition")
 MAX_BODY = 160 * 1024 * 1024  # a settings file or an upload; the lab has its own, smaller limits
+# How long one call of the package may wait here in all for the platform's 429 before it is refused: well under the
+# package's own read timeout (30 s by default), so the package never gives up on a call this then sends.
+RATE_WAIT_MAX_S = 20.0
 
 
 def _envelope(code: str, message: str) -> bytes:
@@ -44,12 +58,16 @@ class Forwarder:
 
     def __init__(self, target: str, headers: dict[str, str], on_answer: Callable[[int, str, bytes], None],
                  opener: Callable[..., Any] | None = None, refuse: Callable[[], str | None] | None = None,
-                 refused: Callable[[str, str], None] | None = None) -> None:
+                 refused: Callable[[str, str], None] | None = None,
+                 waited: Callable[[float], None] | None = None) -> None:
         self.target = target.rstrip("/")
         self.headers = dict(headers)
         self.on_answer = on_answer
         self.refuse = refuse or (lambda: None)
         self.refused = refused or (lambda method, path: None)  # told each call refused here (method, path)
+        self.waited = waited or (lambda s: None)  # told each wait for the platform's 429 (seconds)
+        self._sleep: Callable[[float], None] = time.sleep
+        self._rate_said = False  # the platform's 429 was said on stderr; again after an answer that was not one
         # How a call goes to the lab: the Lab's own way (straight, or through a lab workstation's door).
         self._open = opener or urllib.request.urlopen
         forwarder = self
@@ -111,16 +129,42 @@ class Forwarder:
             return
         headers = {k: h.headers[k] for k in PASSED_ON if h.headers.get(k)}
         headers.update(self.headers)
-        req = urllib.request.Request(self.target + h.path, data=body if body else None, method=method, headers=headers)
-        try:
-            with self._open(req, timeout=UPSTREAM_TIMEOUT_S) as r:
-                status, answer, back = r.status, r.read(), r.headers
-        except urllib.error.HTTPError as e:  # the lab's answer all the same (a 404 of an older InstruCore, a 401)
-            status, answer, back = e.code, e.read(), e.headers
-        except (urllib.error.URLError, OSError) as e:
-            reason = getattr(e, "reason", e)
-            message = f"the lab at {self.target} did not answer ({reason}); nothing was sent to the Moku"
-            self._reply(h, 200, "application/json", _envelope("LAB_UNREACHABLE", message), {})
+        waited = 0.0
+        while True:
+            req = urllib.request.Request(self.target + h.path, data=body if body else None, method=method,
+                                         headers=headers)
+            try:
+                with self._open(req, timeout=UPSTREAM_TIMEOUT_S) as r:
+                    status, answer, back = r.status, r.read(), r.headers
+            except urllib.error.HTTPError as e:  # the lab's answer all the same (a 404 of an older InstruCore, a 401)
+                status, answer, back = e.code, e.read(), e.headers
+            except (urllib.error.URLError, OSError) as e:
+                reason = getattr(e, "reason", e)
+                message = f"the lab at {self.target} did not answer ({reason}); nothing was sent to the Moku"
+                self._reply(h, 200, "application/json", _envelope("LAB_UNREACHABLE", message), {})
+                return
+            if status != 429:
+                self._rate_said = False
+                break
+            refusal = from_response(status, answer, back.get("Content-Type", "") if back else "")
+            if not pace.from_gateway(refusal.detail):
+                break  # not the gateway's own: passed back as it came
+            wait = pace.retry_after(back.get("Retry-After") if back else None)
+            wait = max(pace.MIN_S, wait if wait is not None else pace.DEFAULT_S)
+            if waited + wait <= RATE_WAIT_MAX_S and not self._gone(h):
+                self._say_rate(f"rate-limited by the platform; the moku package's call waits {pace.span(wait)} "
+                               f"here, then is sent again ({refusal.message[:200]})")
+                self.waited(wait)
+                self._sleep(wait)
+                waited += wait
+                if self._gone(h):
+                    return  # the package stopped waiting for this call: it is not sent
+                continue
+            ask = f"; the platform asks to wait {pace.span(wait)}" if wait else ""
+            message = (f"rate-limited by the platform ({refusal.message[:200]}): this call of the moku package did not "
+                       f"reach the lab{ask}")
+            self._say_rate(f"{message}. The moku package does not wait and ask again; the lab SDK's own calls do")
+            self._reply(h, 200, "application/json", _envelope("RATE", message), {})
             return
         content_type = back.get("Content-Type", "")
         if status == 200 and content_type.startswith("application/json"):
@@ -129,6 +173,21 @@ class Forwarder:
             except Exception:  # noqa: BLE001 - recording a write never breaks the call
                 pass
         self._reply(h, status, content_type, answer, {k: back[k] for k in PASSED_BACK[1:] if back.get(k)})
+
+    def _say_rate(self, text: str) -> None:
+        if not self._rate_said:
+            self._rate_said = True
+            print(f"qupai-lab: {text}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _gone(h: http.server.BaseHTTPRequestHandler) -> bool:
+        """The package hung up on this call (its own timeout ran out): its connection reads as closed."""
+        try:
+            sock = h.connection
+            readable, _, _ = select.select([sock], [], [], 0)
+            return bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
 
     @staticmethod
     def _body(h: http.server.BaseHTTPRequestHandler) -> bytes:
